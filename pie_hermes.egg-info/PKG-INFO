@@ -1,8 +1,0 @@
-Metadata-Version: 2.4
-Name: pie-hermes
-Version: 0.1.0
-Summary: Benchmarking harness that drives the Hermes Agent submodule against a pie openai-compat-v2 backend and captures full LLM traffic for prompt-composition analysis.
-Requires-Python: >=3.10
-Requires-Dist: openai>=1.55
-Provides-Extra: dev
-Requires-Dist: pytest>=8; extra == "dev"
