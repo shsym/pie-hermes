@@ -1,0 +1,15 @@
+{
+  "slug": "shallow-hello",
+  "description": "Minimum-cost prompt: no tool use, one-word reply",
+  "tags": [
+    "shallow"
+  ],
+  "query": "Say the word 'ok' and nothing else.",
+  "max_turns": 3,
+  "started_at": "2026-04-21T17:42:50.135778+00:00",
+  "ended_at": "2026-04-21T17:43:02.808373+00:00",
+  "wall_clock_s": 12.673,
+  "exit_code": 0,
+  "n_completions_calls": 1,
+  "hermes_session_id": "20260421_174251_28e4cc"
+}

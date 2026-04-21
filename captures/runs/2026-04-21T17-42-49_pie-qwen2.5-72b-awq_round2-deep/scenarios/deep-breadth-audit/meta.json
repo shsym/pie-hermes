@@ -1,0 +1,16 @@
+{
+  "slug": "deep-breadth-audit",
+  "description": "search + iterative read + structured summary \u2014 the longest expected scenario",
+  "tags": [
+    "deep",
+    "breadth"
+  ],
+  "query": "Audit the directory /opt/hermes/agent for Python files that import 'openai' directly. Use search_files to list candidates, then read each match's top 30 lines, then write a 1-paragraph summary of the import patterns. Limit to 5 files to keep the task bounded.",
+  "max_turns": 20,
+  "started_at": "2026-04-21T17:44:43.200938+00:00",
+  "ended_at": "2026-04-21T17:45:01.168467+00:00",
+  "wall_clock_s": 17.968,
+  "exit_code": 0,
+  "n_completions_calls": 2,
+  "hermes_session_id": "20260421_174443_c922b4"
+}

@@ -1,0 +1,8 @@
+# scenario: deep-multi-read
+# description: 3× read_file(full) + comparative synthesis
+# query: Read /opt/hermes/README.md, /opt/hermes/CONTRIBUTING.md, and /opt/hermes/SECURITY.md in full. Then write a comparison: what audience does each target, and how do they overlap?
+# max_turns: 15
+---
+It seems that the files `/opt/hermes/README.md`, `/opt/hermes/CONTRIBUTING.md`, and `/opt/hermes/SECURITY.md` do not exist in the specified directory. Could you please confirm the correct path or provide an alternative location where these files can be found?
+
+session_id: 20260421_174423_6103f2

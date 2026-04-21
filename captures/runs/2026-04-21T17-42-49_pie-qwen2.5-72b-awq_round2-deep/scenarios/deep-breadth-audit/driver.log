@@ -1,0 +1,8 @@
+# scenario: deep-breadth-audit
+# description: search + iterative read + structured summary — the longest expected scenario
+# query: Audit the directory /opt/hermes/agent for Python files that import 'openai' directly. Use search_files to list candidates, then read each match's top 30 lines, then write a 1-paragraph summary of the import patterns. Limit to 5 files to keep the task bounded.
+# max_turns: 20
+---
+No Python files in the directory /opt/hermes/agent directly import the 'openai' module. The search did not find any matches. If you have a different directory or pattern in mind, let me know and I can try again.
+
+session_id: 20260421_174443_c922b4

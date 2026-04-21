@@ -1,0 +1,8 @@
+# scenario: shallow-file-head
+# description: Single read_file + synthesis turn
+# query: Read the top 40 lines of /opt/hermes/README.md and summarize the quick-install flow in one sentence.
+# max_turns: 5
+---
+The file /opt/hermes/README.md was not found. Could you please confirm the correct path or provide an alternative file to read?
+
+session_id: 20260421_174303_8a7333

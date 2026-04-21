@@ -1,0 +1,8 @@
+# scenario: shallow-hello
+# description: Minimum-cost prompt: no tool use, one-word reply
+# query: Say the word 'ok' and nothing else.
+# max_turns: 3
+---
+ok
+
+session_id: 20260421_174251_28e4cc

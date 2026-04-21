@@ -1,0 +1,10 @@
+# scenario: shallow-terminal
+# description: Single terminal call + report
+# query: Run the shell command `python3 --version` and report the output verbatim.
+# max_turns: 5
+---
+The output of the command `python3 --version` is:
+
+Python 3.13.5
+
+session_id: 20260421_174319_ddcdbd

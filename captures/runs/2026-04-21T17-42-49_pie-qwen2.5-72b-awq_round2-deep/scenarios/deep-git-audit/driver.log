@@ -1,0 +1,8 @@
+# scenario: deep-git-audit
+# description: git log + 2× git show + synthesis — exercises terminal with large outputs
+# query: Run `git -C /opt/hermes log -10 --stat --no-color` to see recent commits. Pick the 2 most interesting commits by stat size and run `git -C /opt/hermes show <hash> --stat --no-color` on each. Then write a 2-paragraph summary of what those commits changed.
+# max_turns: 15
+---
+It looks like the `/opt/hermes` directory is not a Git repository. Could you confirm the correct path to the Git repository you want to inspect? If `/opt/hermes` is the correct path, we might need to initialize a Git repository there or check if the directory exists and contains a `.git` folder.
+
+session_id: 20260421_174406_424297

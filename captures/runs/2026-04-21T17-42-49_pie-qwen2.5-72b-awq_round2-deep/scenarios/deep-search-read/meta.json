@@ -1,0 +1,16 @@
+{
+  "slug": "deep-search-read",
+  "description": "search_files + 3\u00d7 read_file(full) + synthesis \u2014 drives realistic tool-result growth",
+  "tags": [
+    "deep",
+    "file-heavy"
+  ],
+  "query": "Search /opt/hermes for files containing the string 'openai-compat-v2'. Then read the FULL contents of the 3 most relevant matches. Then write a 3-sentence summary of how openai-compat-v2 is referenced across the codebase.",
+  "max_turns": 15,
+  "started_at": "2026-04-21T17:43:34.965064+00:00",
+  "ended_at": "2026-04-21T17:44:05.958952+00:00",
+  "wall_clock_s": 30.994,
+  "exit_code": 0,
+  "n_completions_calls": 3,
+  "hermes_session_id": "20260421_174335_fea758"
+}

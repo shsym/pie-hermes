@@ -1,0 +1,24 @@
+[project]
+name = "pie-hermes"
+version = "0.1.0"
+description = "Benchmarking harness that drives the Hermes Agent submodule against a pie openai-compat-v2 backend and captures full LLM traffic for prompt-composition analysis."
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.55",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["bench"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

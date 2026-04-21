@@ -1,0 +1,8 @@
+# scenario: deep-search-read
+# description: search_files + 3× read_file(full) + synthesis — drives realistic tool-result growth
+# query: Search /opt/hermes for files containing the string 'openai-compat-v2'. Then read the FULL contents of the 3 most relevant matches. Then write a 3-sentence summary of how openai-compat-v2 is referenced across the codebase.
+# max_turns: 15
+---
+The string 'openai-compat-v2' is referenced in the codebase as follows: It appears in a comment in the `driver.py` file, which is part of the scenarios directory, indicating a task to search for files containing this string and to write a summary of its references. In the `run_in_container.sh` script, it is mentioned as an optional backend provider, suggesting that it can be used as a compatibility layer for OpenAI APIs. These references indicate that 'openai-compat-v2' is likely a configuration option or a compatibility layer used in the project.
+
+session_id: 20260421_174335_fea758

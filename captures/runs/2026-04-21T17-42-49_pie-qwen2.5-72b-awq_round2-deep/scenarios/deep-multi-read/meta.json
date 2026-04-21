@@ -1,0 +1,16 @@
+{
+  "slug": "deep-multi-read",
+  "description": "3\u00d7 read_file(full) + comparative synthesis",
+  "tags": [
+    "deep",
+    "file-heavy"
+  ],
+  "query": "Read /opt/hermes/README.md, /opt/hermes/CONTRIBUTING.md, and /opt/hermes/SECURITY.md in full. Then write a comparison: what audience does each target, and how do they overlap?",
+  "max_turns": 15,
+  "started_at": "2026-04-21T17:44:23.250996+00:00",
+  "ended_at": "2026-04-21T17:44:43.199420+00:00",
+  "wall_clock_s": 19.948,
+  "exit_code": 0,
+  "n_completions_calls": 2,
+  "hermes_session_id": "20260421_174423_6103f2"
+}

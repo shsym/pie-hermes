@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Local pie endpoint override (contains the live pod URL)
+configs/cli-config.pie.local.yaml
+
+# Scratch space used by scripts/run_in_container.sh
+bench/_tmp/
+
+# New capture runs are reproducible — don't bloat git with every run.
+# Exception: the historical 2026-04-21 run is committed as a reference
+# baseline (force-add via !captures/runs/2026-04-21*).
+captures/runs/*
+!captures/runs/2026-04-21T17-42-49_pie-qwen2.5-72b-awq_round2-deep/

@@ -1,0 +1,141 @@
+{
+  "run_id": "2026-04-21T17-42-49_pie-qwen2.5-72b-awq_round2-deep",
+  "backend_tag": "pie-qwen2.5-72b-awq",
+  "round_tag": "round2-deep",
+  "hostname": "5e672538a3ad",
+  "started_at": "2026-04-21T17:42:49.341154+00:00",
+  "git": {
+    "sha": "",
+    "branch": "",
+    "dirty": false
+  },
+  "hermes_version": "Hermes Agent v0.10.0 (2026.4.16)",
+  "backend": {
+    "provider": "pie+openai-compat-v2",
+    "model": "Qwen/Qwen2.5-72B-Instruct-AWQ",
+    "pod_id": "fs9ajr91180y4r",
+    "inferlet": "openai-compat-v2-post@0.2.5"
+  },
+  "scenarios": [
+    {
+      "slug": "shallow-hello",
+      "description": "Minimum-cost prompt: no tool use, one-word reply",
+      "tags": [
+        "shallow"
+      ],
+      "query": "Say the word 'ok' and nothing else.",
+      "max_turns": 3,
+      "started_at": "2026-04-21T17:42:50.135778+00:00",
+      "ended_at": "2026-04-21T17:43:02.808373+00:00",
+      "wall_clock_s": 12.673,
+      "exit_code": 0,
+      "n_completions_calls": 1,
+      "hermes_session_id": "20260421_174251_28e4cc"
+    },
+    {
+      "slug": "shallow-file-head",
+      "description": "Single read_file + synthesis turn",
+      "tags": [
+        "shallow"
+      ],
+      "query": "Read the top 40 lines of /opt/hermes/README.md and summarize the quick-install flow in one sentence.",
+      "max_turns": 5,
+      "started_at": "2026-04-21T17:43:02.810119+00:00",
+      "ended_at": "2026-04-21T17:43:19.158590+00:00",
+      "wall_clock_s": 16.348,
+      "exit_code": 0,
+      "n_completions_calls": 2,
+      "hermes_session_id": "20260421_174303_8a7333"
+    },
+    {
+      "slug": "shallow-terminal",
+      "description": "Single terminal call + report",
+      "tags": [
+        "shallow"
+      ],
+      "query": "Run the shell command `python3 --version` and report the output verbatim.",
+      "max_turns": 5,
+      "started_at": "2026-04-21T17:43:19.160400+00:00",
+      "ended_at": "2026-04-21T17:43:34.963563+00:00",
+      "wall_clock_s": 15.803,
+      "exit_code": 0,
+      "n_completions_calls": 1,
+      "hermes_session_id": "20260421_174319_ddcdbd"
+    },
+    {
+      "slug": "deep-search-read",
+      "description": "search_files + 3\u00d7 read_file(full) + synthesis \u2014 drives realistic tool-result growth",
+      "tags": [
+        "deep",
+        "file-heavy"
+      ],
+      "query": "Search /opt/hermes for files containing the string 'openai-compat-v2'. Then read the FULL contents of the 3 most relevant matches. Then write a 3-sentence summary of how openai-compat-v2 is referenced across the codebase.",
+      "max_turns": 15,
+      "started_at": "2026-04-21T17:43:34.965064+00:00",
+      "ended_at": "2026-04-21T17:44:05.958952+00:00",
+      "wall_clock_s": 30.994,
+      "exit_code": 0,
+      "n_completions_calls": 3,
+      "hermes_session_id": "20260421_174335_fea758"
+    },
+    {
+      "slug": "deep-git-audit",
+      "description": "git log + 2\u00d7 git show + synthesis \u2014 exercises terminal with large outputs",
+      "tags": [
+        "deep",
+        "terminal-heavy"
+      ],
+      "query": "Run `git -C /opt/hermes log -10 --stat --no-color` to see recent commits. Pick the 2 most interesting commits by stat size and run `git -C /opt/hermes show <hash> --stat --no-color` on each. Then write a 2-paragraph summary of what those commits changed.",
+      "max_turns": 15,
+      "started_at": "2026-04-21T17:44:05.961043+00:00",
+      "ended_at": "2026-04-21T17:44:23.249521+00:00",
+      "wall_clock_s": 17.288,
+      "exit_code": 0,
+      "n_completions_calls": 2,
+      "hermes_session_id": "20260421_174406_424297"
+    },
+    {
+      "slug": "deep-multi-read",
+      "description": "3\u00d7 read_file(full) + comparative synthesis",
+      "tags": [
+        "deep",
+        "file-heavy"
+      ],
+      "query": "Read /opt/hermes/README.md, /opt/hermes/CONTRIBUTING.md, and /opt/hermes/SECURITY.md in full. Then write a comparison: what audience does each target, and how do they overlap?",
+      "max_turns": 15,
+      "started_at": "2026-04-21T17:44:23.250996+00:00",
+      "ended_at": "2026-04-21T17:44:43.199420+00:00",
+      "wall_clock_s": 19.948,
+      "exit_code": 0,
+      "n_completions_calls": 2,
+      "hermes_session_id": "20260421_174423_6103f2"
+    },
+    {
+      "slug": "deep-breadth-audit",
+      "description": "search + iterative read + structured summary \u2014 the longest expected scenario",
+      "tags": [
+        "deep",
+        "breadth"
+      ],
+      "query": "Audit the directory /opt/hermes/agent for Python files that import 'openai' directly. Use search_files to list candidates, then read each match's top 30 lines, then write a 1-paragraph summary of the import patterns. Limit to 5 files to keep the task bounded.",
+      "max_turns": 20,
+      "started_at": "2026-04-21T17:44:43.200938+00:00",
+      "ended_at": "2026-04-21T17:45:01.168467+00:00",
+      "wall_clock_s": 17.968,
+      "exit_code": 0,
+      "n_completions_calls": 2,
+      "hermes_session_id": "20260421_174443_c922b4"
+    }
+  ],
+  "ended_at": "2026-04-21T17:45:01.169571+00:00",
+  "exit_codes": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "all_ok": true
+}

@@ -1,0 +1,15 @@
+{
+  "slug": "shallow-terminal",
+  "description": "Single terminal call + report",
+  "tags": [
+    "shallow"
+  ],
+  "query": "Run the shell command `python3 --version` and report the output verbatim.",
+  "max_turns": 5,
+  "started_at": "2026-04-21T17:43:19.160400+00:00",
+  "ended_at": "2026-04-21T17:43:34.963563+00:00",
+  "wall_clock_s": 15.803,
+  "exit_code": 0,
+  "n_completions_calls": 1,
+  "hermes_session_id": "20260421_174319_ddcdbd"
+}

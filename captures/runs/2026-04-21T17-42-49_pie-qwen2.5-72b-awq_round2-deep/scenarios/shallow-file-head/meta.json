@@ -1,0 +1,15 @@
+{
+  "slug": "shallow-file-head",
+  "description": "Single read_file + synthesis turn",
+  "tags": [
+    "shallow"
+  ],
+  "query": "Read the top 40 lines of /opt/hermes/README.md and summarize the quick-install flow in one sentence.",
+  "max_turns": 5,
+  "started_at": "2026-04-21T17:43:02.810119+00:00",
+  "ended_at": "2026-04-21T17:43:19.158590+00:00",
+  "wall_clock_s": 16.348,
+  "exit_code": 0,
+  "n_completions_calls": 2,
+  "hermes_session_id": "20260421_174303_8a7333"
+}

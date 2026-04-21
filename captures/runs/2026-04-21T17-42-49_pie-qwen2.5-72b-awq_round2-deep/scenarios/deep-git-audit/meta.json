@@ -1,0 +1,16 @@
+{
+  "slug": "deep-git-audit",
+  "description": "git log + 2\u00d7 git show + synthesis \u2014 exercises terminal with large outputs",
+  "tags": [
+    "deep",
+    "terminal-heavy"
+  ],
+  "query": "Run `git -C /opt/hermes log -10 --stat --no-color` to see recent commits. Pick the 2 most interesting commits by stat size and run `git -C /opt/hermes show <hash> --stat --no-color` on each. Then write a 2-paragraph summary of what those commits changed.",
+  "max_turns": 15,
+  "started_at": "2026-04-21T17:44:05.961043+00:00",
+  "ended_at": "2026-04-21T17:44:23.249521+00:00",
+  "wall_clock_s": 17.288,
+  "exit_code": 0,
+  "n_completions_calls": 2,
+  "hermes_session_id": "20260421_174406_424297"
+}
