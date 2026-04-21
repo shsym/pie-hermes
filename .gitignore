@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Local pie endpoint override (contains the live pod URL)
+configs/cli-config.pie.local.yaml
+
+# Scratch space used by scripts/run_in_container.sh
+bench/_tmp/
+
+# Capture runs are reproducible artifacts — don't commit them.
+captures/runs/*
