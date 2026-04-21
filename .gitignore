@@ -1,16 +1,42 @@
+# --- Python ---
 __pycache__/
 *.pyc
+*.pyo
 .venv/
+venv/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
 *.egg-info/
 build/
 dist/
 
-# Local pie endpoint override (contains the live pod URL)
+# --- OS / editor noise ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Claude Code local state ---
+.claude/
+
+# --- Secrets / local env ---
+.env
+.env.*
+
+# --- Local pie endpoint override (contains the live pod URL) ---
 configs/cli-config.pie.local.yaml
 
-# Scratch space used by scripts/run_in_container.sh
+# --- Scratch space used by scripts/run_in_container.sh ---
 bench/_tmp/
 
-# Capture runs are reproducible artifacts — don't commit them.
+# --- Test output logs (per CLAUDE.md convention: test-YYYYMMDD-HHMMSS.log) ---
+test-*.log
+
+# --- Capture runs are reproducible artifacts — don't commit them. ---
 captures/runs/*
