@@ -12,12 +12,23 @@ import os
 
 if os.environ.get("HERMES_CAPTURE_FILE") or os.environ.get("HERMES_CAPTURE_DIR"):
     try:
-        from bench.install import install
+        from bench.install import install as _install_capture
 
-        install()
+        _install_capture()
     except Exception as exc:
         import logging
 
         logging.getLogger(__name__).warning(
-            "pie-hermes sitecustomize failed: %s", exc
+            "pie-hermes sitecustomize (capture): %s", exc
+        )
+
+    try:
+        from bench.install_optimizers import install as _install_optimizers
+
+        _install_optimizers()
+    except Exception as exc:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "pie-hermes sitecustomize (optimizers): %s", exc
         )
