@@ -189,6 +189,15 @@ pub async fn handle_chat_completions(
         .as_deref()
         .and_then(crate::variant::decode_ephemeral_payload);
 
+    // Defense-in-depth: parse_ephemeral_header (variant.rs:85+) already validates
+    // well-formedness, so a Some(header) that decodes to None should be unreachable.
+    // Catches if parse_ephemeral_header is ever relaxed without updating the decode
+    // path. No-op in release.
+    debug_assert!(
+        ephemeral_header.is_none() || ephemeral_decoded.is_some(),
+        "ephemeral header passed parse_ephemeral_header validation but decode_ephemeral_payload returned None — invariant broken"
+    );
+
     // Parse request
     let mut request: ChatCompletionRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
