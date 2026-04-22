@@ -139,13 +139,35 @@ pub async fn handle_export(body_bytes: Vec<u8>, responder: Responder) -> Finishe
         .await;
     }
 
+    let handle = handle_name_for(&req.variant_name);
+
+    // "none" carries empty text — no KV pages to export.  Skip the engine
+    // round-trip entirely; save empty metadata so the import path can detect
+    // this variant is registered (token_ids=[]), and return token_count=0.
+    if req.text.is_empty() {
+        save_metadata(
+            &req.variant_name,
+            &VariantMetadata {
+                token_ids: vec![],
+                kv_page_last_len: 0,
+            },
+        );
+        let resp = ExportResponse {
+            handle: handle.clone(),
+            token_count: 0,
+        };
+        let json = serde_json::to_string(&resp).unwrap_or_default();
+        let http = Response::builder()
+            .header("Content-Type", "application/json")
+            .body(json.into_body())
+            .unwrap();
+        return responder.respond(http).await;
+    }
+
     let model = inferlet::get_auto_model();
     let mut ctx = Context::new(&model);
-    if !req.text.is_empty() {
-        ctx.fill_system(&req.text);
-        ctx.flush().await;
-    }
-    let handle = handle_name_for(&req.variant_name);
+    ctx.fill_system(&req.text);
+    ctx.flush().await;
     let token_count = ctx.get_token_ids().len();
     let kv_page_last_len = ctx.get_kv_page_last_len();
     let token_ids = ctx.get_token_ids().to_vec();
