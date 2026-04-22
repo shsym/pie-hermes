@@ -342,15 +342,14 @@ pub async fn handle_chat_completions(
     // Skip session KV save for fork path — forked contexts are ephemeral.
     // Future: export winning fork's KV.
     if fork_meta.is_none() {
-        // Both stores run unconditionally on this experimental branch (task #27
-        // naive flip).  The previous short-circuit ("if block save did
-        // anything, skip session_kv") broke multi-turn KV reuse.
-        // save_ctx_blocks's final-block fast-path (skip re-export if the entry
-        // already exists) keeps the hot path cheap.
-        if let Some(ref bc_tokens) = session_incoming_tokens {
-            let page_size = model.get_kv_page_size() as usize;
-            let _ = crate::block_cache::save_ctx_blocks(&ctx, bc_tokens, page_size);
-        }
+        // Chat-path save_ctx_blocks intentionally omitted on this experimental
+        // branch.  The warmup handler (/chat-prefix:warm) already populates the
+        // block_cache store; calling save_ctx_blocks here additionally on every
+        // chat request floods the runtime's export registry with per-request
+        // entries (each request's user turn mutates the final chain hash), and
+        // produced ExportSync FAILED / PointerNotAllocated errors that hung
+        // connections in our c=4/8/16 sweep.  Task #27 Non-goals rule out
+        // redesigning the chain-hash scheme, so we validate lookup-only here.
         save_session_kv_state(&ctx, &request, session_incoming_tokens.as_deref());
     }
 
@@ -980,14 +979,9 @@ async fn handle_streaming(
         let _ = body.flush().await;
     }
 
-    // Save block-level cache entries from this request's context.
-    // Both stores run unconditionally on this experimental branch (task #27
-    // naive flip).  save_ctx_blocks's final-block fast-path keeps the hot
-    // path cheap.  Mirror of the non-streaming path above.
-    if let Some(ref bc_tokens) = session_incoming_tokens {
-        let page_size = model.get_kv_page_size() as usize;
-        let _ = crate::block_cache::save_ctx_blocks(&ctx, bc_tokens, page_size);
-    }
+    // Chat-path save_ctx_blocks intentionally omitted on this experimental
+    // branch (matches the non-streaming path).  Warmup handler populates
+    // block_cache; chat-path re-saves floods the runtime's export registry.
     save_session_kv_state(&ctx, request, session_incoming_tokens.as_deref());
 
     // [Phase-B instrumentation] Emit the raw generated text as an SSE
