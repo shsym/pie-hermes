@@ -1,7 +1,7 @@
 [package]
-name = "openai-compat-v2"
-version = "0.2.5"
-description = "OpenAI chat completions HTTP server inferlet for Pie (v2: session-affine KV retention, X-Pie-Session-Id header)"
+name = "hermes-openai-compat"
+version = "0.1.0"
+description = "Hermes-specific OpenAI-compatible inferlet for pie (vendored from openai-compat-v2; diverges with variant KV / skill_view / read_context / OOB metadata)"
 authors = ["PieClaw"]
 
 [runtime]

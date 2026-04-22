@@ -1,8 +1,8 @@
 [package]
-name = "openai-compat-v2"
+name = "hermes-openai-compat"
 version = "0.1.0"
 edition = "2024"
-description = "OpenAI chat completions HTTP server inferlet for Pie (v2: session-affine KV retention)"
+description = "Hermes-specific OpenAI-compatible inferlet for pie (vendored from openai-compat-v2; diverges with variant KV / skill_view / read_context / OOB metadata)"
 
 [lib]
 # rlib added so `cargo test --target <host>` can link the crate for
