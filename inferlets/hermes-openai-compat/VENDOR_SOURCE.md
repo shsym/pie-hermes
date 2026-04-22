@@ -113,3 +113,33 @@ updated prepare_execution signature, updated handle_chat_completions),
 **Upstream-worthy:** the generic `from_imported_state` usage pattern and
 the `parse_variant_header` helper are reusable; the specific variant
 names/store keys are pie-hermes business.  Task #28 decides at merge time.
+
+### 4. `X-Hermes-Ephemeral` header parsing in `src/variant.rs` + `src/lib.rs` + `src/handler.rs` (Task 1G.3)
+
+**Added:** 2026-04-22, Task 1G.3 (pie-hermes Phase 1).
+
+**Reason:** Idea G routes ephemeral metadata (chat_id, user handle, reactions,
+platform quirks) out-of-band via `X-Hermes-Ephemeral: <base64-utf8>` header
+instead of appending it as prompt text (see pie-hermes `EphemeralOOBRouter`,
+task 1G.2). Phase-1 scope on the inferlet side is minimal: validate the
+header is well-formed base64 and log receipt (length-only — never decoded
+into logs) so Phase-1G plumbing is observable on the live pod. Actual
+platform-specific post-generation formatting is deferred to a later phase.
+
+**Surface:** new `parse_ephemeral_header` helper co-located with
+`parse_variant_header` in `src/variant.rs` (splitting into a `headers.rs`
+module for one additional function is premature; both helpers parse
+`X-Hermes-*` request headers and the file already owns that shape). New
+header extraction in the chat-completions router arm in `src/lib.rs`. New
+optional `ephemeral_header: Option<String>` parameter on
+`handler::handle_chat_completions`. New `base64 = "0.22"` Cargo dependency
+with `default-features = false, features = ["alloc", "std"]` — kept minimal
+for wasm32-wasip2.
+
+**Logging discipline:** `parse_ephemeral_header` intentionally returns the
+raw base64 string (not the decoded bytes) so decoded user data never crosses
+the validation boundary via return value. The handler only logs `b64.len()`.
+
+**Upstream-worthy:** conditionally. Pieclaw may want a generic OOB-metadata
+header pattern; task #28 can decide at merge time whether to carve the
+helper into a generic `headers.rs` module.
