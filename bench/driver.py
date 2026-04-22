@@ -36,6 +36,53 @@ from typing import Any
 
 
 # -----------------------------------------------------------------------------
+# Gateway ephemeral fixture
+# -----------------------------------------------------------------------------
+
+# Fixture ephemeral payload for scenarios tagged "gateway". Simulates what a
+# real gateway (Telegram, Discord, etc.) would append per-message: chat_id,
+# user handle, reply-to ids, thread summary, reactions, platform quirks.
+# ~330 tokens at 4 chars/token (measured against Qwen tokenizer at capture time).
+GATEWAY_EPHEMERAL_FIXTURE = (
+    "chat_id: 4738124\n"
+    "chat_type: supergroup\n"
+    "chat_title: deploy-ops-lounge\n"
+    "user_handle: @alice_demo\n"
+    "user_id: 9981273\n"
+    "user_display_name: Alice Demo (SRE, on-call rotation C)\n"
+    "reply_to_message_id: 88273\n"
+    "reply_to_excerpt: \"let's hold the 1.42 rollout until the canary "
+    "finishes its 2h soak — the p99 regression from last Thursday is "
+    "still unexplained\"\n"
+    "thread_summary: ongoing discussion about deployment rollout; last 12 "
+    "messages covered rollback procedure, CI pipeline status, whether to "
+    "page the on-call, and an unresolved p99 regression from last "
+    "Thursday. Thread pinned by @ops_lead; @alice_demo has been driving.\n"
+    "reactions_on_last_message: thumbsup=3, fire=1, heart=2, eyes=4\n"
+    "platform: telegram\n"
+    "platform_features: supports_markdown, supports_code_blocks, "
+    "supports_images, supports_inline_buttons, max_message_length=4096, "
+    "supports_reactions=true\n"
+    "last_activity_minutes_ago: 2\n"
+    "user_role: project_contributor\n"
+    "user_permissions: can_post, can_pin, can_mention_all=false\n"
+    "user_preferred_response_style: concise, direct, minimal_preamble, "
+    "prefers_bullet_lists_for_3plus_items\n"
+    "locale: en-US\n"
+    "timezone_offset_minutes: -240\n"
+    "current_focus_tag: deployment\n"
+    "pinned_context: team is in the middle of a rollout window (Thursday "
+    "evening EST); prioritize actionable responses over exposition. "
+    "Canary group is 5% of fleet. Rollback playbook lives at "
+    "runbooks/deploy/rollback-v1.42.md.\n"
+    "conversation_depth_turn: 14\n"
+    "message_count_in_thread: 47\n"
+    "unread_mentions_of_user: 0\n"
+    "last_bot_response_latency_ms: 1840\n"
+)
+
+
+# -----------------------------------------------------------------------------
 # Scenario catalogue
 # -----------------------------------------------------------------------------
 
@@ -180,6 +227,16 @@ def run_scenario(slug: str, query: str, max_turns: int, description: str,
     # Make sure no lingering DIR setting interferes
     env.pop("HERMES_CAPTURE_DIR", None)
 
+    # Inject gateway-shaped ephemeral metadata for scenarios tagged "gateway".
+    # hermes-agent's CLI reads HERMES_EPHEMERAL_SYSTEM_PROMPT and feeds it to
+    # AIAgent.ephemeral_system_prompt (cli.py:1875). The ephemeral fixture is
+    # deterministic; meta.json records its length only, not its content.
+    if "gateway" in tags:
+        env["HERMES_EPHEMERAL_SYSTEM_PROMPT"] = GATEWAY_EPHEMERAL_FIXTURE
+    else:
+        # Don't leak ephemeral into non-gateway scenarios, even if caller set it.
+        env.pop("HERMES_EPHEMERAL_SYSTEM_PROMPT", None)
+
     started_at = dt.datetime.now(dt.timezone.utc).isoformat()
     t0 = time.monotonic()
     print(f"=== {slug} ({','.join(tags)}) ===", flush=True)
@@ -215,6 +272,11 @@ def run_scenario(slug: str, query: str, max_turns: int, description: str,
         "exit_code": rc,
         "n_completions_calls": n_calls,
         "hermes_session_id": session_id,
+        # Deterministic ephemeral fixture length; 0 for non-gateway scenarios.
+        # Lets the analyzer filter/compare gateway-tagged runs post-hoc.
+        "ephemeral_fixture_chars": (
+            len(GATEWAY_EPHEMERAL_FIXTURE) if "gateway" in tags else 0
+        ),
     }
     meta_path.write_text(json.dumps(meta, indent=2) + "\n")
     print(f"    exit={rc}  wall={wall_s:.1f}s  calls={n_calls}  session={session_id}", flush=True)
