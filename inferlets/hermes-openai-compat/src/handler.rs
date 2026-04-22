@@ -172,17 +172,14 @@ pub async fn handle_chat_completions(
     let t_entry = std::time::Instant::now();
     let body_len = body_bytes.len();
 
-    // Phase-1G: observe the X-Hermes-Ephemeral plumbing is alive. Log only the
-    // raw base64 length, NEVER the decoded bytes — ephemeral payloads carry
-    // user-scoped metadata (chat_id, handle, reactions) which must not leak
-    // through inferlet telemetry. Post-generation formatting logic lives in a
-    // later phase.
-    if let Some(b64) = &ephemeral_header {
-        eprintln!(
-            "hermes-ephemeral: header received ({} bytes base64); no post-processing in Phase 1",
-            b64.len()
-        );
-    }
+    // Phase-1G: the ephemeral_header is accepted here but deliberately unused
+    // on this path — post-generation formatting will arrive in a later phase.
+    // We intentionally avoid calling eprintln!() here: under pie's current
+    // wstd::http_server runtime, writing to stderr from inside the async
+    // handler caused the request to hang indefinitely (no response line was
+    // ever sent on the connection).  Bind + drop the reference so the type
+    // signature documents the plumbing without side-effects.
+    let _ = &ephemeral_header;
 
     // Parse request
     let mut request: ChatCompletionRequest = match serde_json::from_slice(&body_bytes) {
