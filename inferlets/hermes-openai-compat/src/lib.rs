@@ -38,6 +38,7 @@ pub(crate) mod tool_format;
 mod tool_parser;
 mod tools_grammar;
 mod types;
+mod variant;
 
 use inferlet::sampler::Sample;
 use wstd::http::body::IncomingBody;
@@ -131,6 +132,14 @@ async fn main(mut req: Request<IncomingBody>, res: Responder) -> Finished {
                 return error_response(res, 400, "Failed to read request body").await;
             }
             handler::handle_chat_prefix_warm(body_bytes, res).await
+        }
+
+        (Method::POST, "/v1/pie/variant/export") => {
+            let mut body_bytes = Vec::new();
+            if read_body(req.body_mut(), &mut body_bytes).await.is_err() {
+                return error_response(res, 400, "Failed to read request body").await;
+            }
+            variant::handle_export(body_bytes, res).await
         }
 
         (Method::GET, "/v1/models") => {
