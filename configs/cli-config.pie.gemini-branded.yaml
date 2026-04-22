@@ -1,0 +1,54 @@
+# Hermes CLI config for running against a pie openai-compat-v2 endpoint.
+#
+# Used by task #22 to capture real prompt/token numbers from Hermes when
+# routed through pie on runpod (model: Qwen2.5-72B-Instruct-AWQ).
+#
+# Base URL is intentionally a placeholder — replace with the live pod URL
+# before starting the session. cli-config.pie.local.yaml is the gitignored
+# variant that holds the real URL for a given run.
+
+model:
+  default: "stub-gemini-2.5-for-measurement"
+
+  # "custom" dispatches via the OpenAI-wire chat-completions path, which is
+  # exactly the wire protocol pie's openai-compat-v2 inferlet serves.
+  provider: "custom"
+
+  # Pod URL — overwrite with the forwarded port (e.g. http://127.0.0.1:18095/v1
+  # if SSH-tunneled) or the pod's public URL.
+  base_url: "http://REPLACE_ME:8080/v1"
+
+  # Local pie doesn't require auth; the SDK rejects empty keys, so we set a
+  # throwaway token. Override with OPENAI_API_KEY env if the pod is behind auth.
+  api_key: "pie-local-no-auth"
+
+  # Qwen2.5-72B-Instruct: 32K native, 128K with YARN. Hermes requires at
+  # least 64K; we use 131072 (128K) to match its standard capacity for
+  # long-form tool-use sessions. Pie's prefix-cache handles the tail fine.
+  context_length: 131072
+
+agent:
+  # CRITICAL for Qwen: the default "auto" mode only injects tool-use
+  # enforcement for gpt/codex/gemini/gemma/grok. Pieclaw showed Qwen needs
+  # the same explicit steering to avoid confabulation over tool calls, so
+  # force it on here. Without this, we'd measure a degenerate prompt shape
+  # that underweights tool-schema payload.
+  tool_use_enforcement: true
+
+  # Keep iterations reasonable — the capture run isn't a production task.
+  max_turns: 40
+
+  # Qwen2.5-Instruct is non-thinking; reasoning effort is a no-op on the
+  # wire but we set "none" for clarity.
+  reasoning_effort: "none"
+
+  verbose: false
+
+# Keep the full CLI toolset so we measure a realistic prompt shape
+# (system prompt + all tool schemas Hermes normally advertises).
+platform_toolsets:
+  cli: [hermes-cli]
+
+# Compression thresholds — leave at package defaults so prompt growth
+# over a session is authentically Hermes's normal behavior.
+compression: {}
