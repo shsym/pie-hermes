@@ -255,3 +255,30 @@ appended after cached prefix via `messages` mutation" pattern generalises
 beyond hermes; task #28 decides at merge time.  Both tradeoffs above
 should accompany any upstream patch so reviewers know what the design
 covers and what it explicitly defers.
+
+### 7. `src/context_section.rs` + `POST /v1/pie/context-section/register` route (Task 2.1, Idea D)
+
+**Added:** 2026-04-22, Phase 2.1 (pie-hermes).
+
+**Reason:** Idea D (context-files summary) replaces verbatim AGENTS.md
+(and similar) content in the system prompt with a compact index. The
+section bodies are registered server-side as named KV-prefix handles
+keyed by `(section_id, body_hash)`. At inference time, a `read_context`
+tool intercept (Task 2.2 / divergence #8) imports the prefix and surfaces
+the body to the model on demand, instead of paying the body's prompt-
+token cost on every request.
+
+**Surface:** one new source module (`src/context_section.rs`); one new
+route arm in `src/lib.rs` (`POST /v1/pie/context-section/register`); a
+side-table at `v1.section.<section_id>.latest_hash` so the read_context
+intercept can resolve a section_id to the latest body without the agent
+re-supplying the hash per-call.
+
+**Storage keys (under inferlet::store_set namespace):**
+- `v1.section.<section_id>.<body_hash>.meta` — JSON SectionMetadata.
+- `v1.section.<section_id>.latest_hash`      — most recently registered hash.
+- KV-pages handle: `hermes-section-<section_id>-<body_hash>`.
+
+**Upstream-worthy:** conditionally — same as #2 / #6. The "register a
+named prefix and intercept a tool call to import it" pattern is generic;
+the specific naming scheme is pie-hermes business. Task #28 decides.
