@@ -22,6 +22,8 @@
 #   SCENARIO_FILTER    — space-separated slug list to restrict scenarios.
 #   HERMES_IMAGE       — Docker image tag for the hermes runtime
 #                        (default: hermes-task22).
+#   HERMES_CONFIG_PATH — Source cli-config yaml (default: configs/cli-config.pie.yaml).
+#                        Override for Phase-1 variants (GPT-branded, Gemini-branded).
 
 set -euo pipefail
 
@@ -32,6 +34,12 @@ HOST_BASE_URL="${HOST_BASE_URL:-http://host.docker.internal:18095/v1}"
 BACKEND_TAG="${BACKEND_TAG:-unknown-backend}"
 ROUND_TAG="${ROUND_TAG:-round-unknown}"
 HERMES_IMAGE="${HERMES_IMAGE:-hermes-task22}"
+HERMES_CONFIG_PATH="${HERMES_CONFIG_PATH:-configs/cli-config.pie.yaml}"
+
+if [[ ! -f "$HERMES_CONFIG_PATH" ]]; then
+    echo "error: HERMES_CONFIG_PATH=$HERMES_CONFIG_PATH does not exist" >&2
+    exit 2
+fi
 
 mkdir -p captures/runs bench/_tmp
 
@@ -40,7 +48,7 @@ mkdir -p captures/runs bench/_tmp
 # bridge bind-mounts it as a file, not an autocreated directory.
 TMP_CONFIG="$REPO_ROOT/bench/_tmp/pie-run-config.yaml"
 trap 'rm -f "$TMP_CONFIG"' EXIT
-sed "s|http://REPLACE_ME:8080/v1|${HOST_BASE_URL}|" configs/cli-config.pie.yaml > "$TMP_CONFIG"
+sed "s|http://REPLACE_ME:8080/v1|${HOST_BASE_URL}|" "${HERMES_CONFIG_PATH:-configs/cli-config.pie.yaml}" > "$TMP_CONFIG"
 chmod 644 "$TMP_CONFIG"
 
 docker run --rm -i \
