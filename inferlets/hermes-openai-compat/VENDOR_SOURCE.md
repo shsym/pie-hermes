@@ -45,3 +45,30 @@ release builds target `wasm32-wasip2` and are unaffected.
 pieclaw/inferlets/openai-compat-v2. Task #28 should push this fix back
 to pieclaw on its next sync pass; once accepted upstream, remove from
 this divergence list.
+
+### 2. `src/variant.rs` + `POST /v1/pie/variant/export` route (Task 1A.2)
+
+**Added:** 2026-04-22, Task 1A.2 (pie-hermes Phase 1).
+
+**Reason:** Idea A optimization pre-exports named KV handles per model-family
+variant (codex / google / none) so the X-Hermes-Variant header can trigger
+an import at request time instead of paying the ~1.1k–2.5k-token cost of
+the GOOGLE_MODEL_OPERATIONAL_GUIDANCE / OPENAI_MODEL_EXECUTION_GUIDANCE
+/ TOOL_USE_ENFORCEMENT_GUIDANCE blocks in every request.
+
+**Surface:** one new source module (`src/variant.rs`) and one new route arm
+in `src/lib.rs`. The route reads a JSON body {variant_name, text}, prefills
+a standalone Context, and calls `ctx.queue().export_resource_sync(
+Resource::KvPage, ptrs, "hermes-variant-<name>")`. Consumed by
+`scripts/export-variant-kv.py` on the host side.
+
+**SDK note:** `export_resource_sync` lives on `Queue`, not `Model` (the
+originating task brief stated Model; the pinned pie-vllm submodule puts
+it on Queue at `pie/sdk/rust/inferlet/src/lib.rs:323`). We call it via the
+Context's own queue (`ctx.queue()`), matching the pattern used by the
+existing `/v1/debug/kv-exports` route.
+
+**Upstream-worthy:** yes, conditionally. Pieclaw may want this route as a
+generic "KV pre-population" utility; the specifics of variant-naming are
+pie-hermes business. Task #28 can decide at merge time whether to upstream
+the route skeleton + make the handle namespace client-configurable.
