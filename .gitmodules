@@ -1,3 +1,6 @@
 [submodule "hermes-agent"]
 	path = hermes-agent
 	url = https://github.com/shsym/hermes-agent.git
+[submodule "pie-vllm"]
+	path = pie-vllm
+	url = git@github.com:shsym/pie-vllm.git
