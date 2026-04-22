@@ -93,6 +93,25 @@ SCENARIOS: dict[str, tuple[str, int, str, list[str]]] = {
         "search + iterative read + structured summary — the longest expected scenario",
         ["deep", "breadth"],
     ),
+
+    # ---- Gateway: simulate per-message ephemeral metadata (Idea G target) ----
+    # These scenarios exist to measure the ephemeral-slot overhead. The
+    # ephemeral payload (chat_id, user handle, reply-to, reactions, platform
+    # quirks) is attached by bench/hermes_gateway_shim.py (Task 1G.4) when the
+    # `gateway` tag is present. Without the shim, they run like any other
+    # scenario — which is fine; those captures become the pre-1G baseline.
+    "gateway-ephemeral-chat": (
+        "Summarize what I just sent you in 10 words.",
+        3,
+        "Gateway-shaped: ephemeral metadata appended per-message (chat_id, user handle, reply-to)",
+        ["gateway", "ephemeral"],
+    ),
+    "gateway-ephemeral-chat-3turn": (
+        "Give me three distinct one-liners on the topic I just sent.",
+        5,
+        "Gateway-shaped, multi-turn: ephemeral metadata compounds across turns",
+        ["gateway", "ephemeral", "multi-turn"],
+    ),
 }
 
 
