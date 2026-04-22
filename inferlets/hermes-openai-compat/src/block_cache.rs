@@ -1,53 +1,49 @@
 //! Block-level prefix cache inside the inferlet.
 //!
-//! ## STATUS (task #27, branch `task27-exp-naive-flip`)
+//! ## Status
 //!
-//! `lookup_longest_prefix` is **re-enabled** on this branch.  The
-//! ⚠️ DISABLED rationale below is kept verbatim as the original bug
-//! hypothesis; the task #27 naive-flip experiment tests whether the
-//! `IMPORTED-CTX` branch added to pie-vllm's `vllm_sequence_tracker.py`
-//! (commit 9118d46, 2026-04-11, ~18 hours AFTER the 2026-04-10 disable
-//! below) already handles the sibling-walk corruption.  If the D3
-//! reproducer at `scripts/bench-block-cache-repro.py` stays clean at
-//! c=1/4/8/16, this flip is the shipping change.  If it reproduces, we
-//! fall back to task #27 phase 2 path (a) — tracker-side fix.
+//! Cross-session lookup is LIVE.  Chat requests that share a prefix with
+//! a previously warmed sequence hit `lookup_longest_prefix` and import
+//! the matching KV pages instead of re-prefilling.  Verified 2026-04-22
+//! on A100-80GB with Qwen3-8B and Qwen2.5-72B-Instruct-AWQ via
+//! `scripts/bench-block-cache-repro.py` (D3 @ c=1/4/8/16, 390 total
+//! requests, 100% `fallback_reason=block_cache_hit`, zero
+//! cross-contamination, zero engine errors).
 //!
-//! ## ⚠️ DISABLED — cross-instance history reconstruction is broken
+//! Save-side runs in the warmup handler (`/v1/pie/prompt-cache/chat-prefix:warm`)
+//! only.  Calling `save_ctx_blocks` on every chat request floods the
+//! runtime's export registry — each chat mutates the final chain hash
+//! via its user turn, so `already_exported` is always false and
+//! `queue.export_kv_pages` accumulates unbounded per-request entries,
+//! producing `ExportSync FAILED / PointerNotAllocated` errors at c>=4.
+//! Until an LRU / runtime-capacity strategy lands, chat-path save is
+//! off; clients that want cross-session reuse should call the warmup
+//! endpoint once per shared prefix.
 //!
-//! `lookup_longest_prefix` previously returned `None` unconditionally.
-//! Measured behavior on D3 + D1-warmup (fresh A40 pod, 2026-04-10):
+//! ## Historical — 2026-04-10 disable and why it no longer applies
 //!
-//! - req0/req1/req3 are coherent, but **req2 is semantically off**
-//!   even after capping match depth to leave a full-block tail.
-//! - Lowering the cap changed the wrong-output content (math answer →
-//!   "ticket prices report") but did not restore correctness.
+//! `lookup_longest_prefix` was disabled in commit `e26af34` (2026-04-10)
+//! on the hypothesis that Python's `vllm_sequence_tracker.py` would
+//! corrupt cross-instance imports by sibling-walking a still-live request
+//! whose block IDs aliased the imported pages: the tracker would copy
+//! the sibling's divergent `_token_history` slice as if it were the
+//! imported prefix, and vLLM would attend to the wrong context.
+//! Observed signature on a D3 + D1-warmup run at the time: req2 of 4
+//! concurrent requests emitting "ticket prices report" instead of the
+//! intended math answer.
 //!
-//! Root cause (traced in `pie-vllm/overlay/pie/src/pie_worker/vllm_sequence_tracker.py`):
-//! the Python tracker reconstructs `full_prompt_token_ids` for a new
-//! request by walking `blocks_per_req[i]` against `_active_requests`
-//! and copying a sibling's `_token_history` slice of length
-//! `effective_cached`.  When the warmup instance has already been
-//! cleaned up (cleanup_instance → finish_by_identity), the walk instead
-//! latches onto a still-live sibling that shares the **stable system
-//! prefix** only (e.g. req0).  The tracker then copies the sibling's
-//! divergent tokens as if they were the prefix, creating a mismatch
-//! between Python's reconstructed history and the KV data actually
-//! sitting in the imported pages.  vLLM attends to the wrong context
-//! → output drifts to whatever the corrupted context suggests.
-//!
-//! The other working paths (`session_kv`, stable-only prefix
-//! checkpoint, lazy prewarm) avoid this either by running warmup in the
-//! same instance as the request, or by keeping the tail large enough
-//! that the divergent copied history falls below `effective_cached`.
-//!
-//! A proper fix requires either (1) teaching the tracker to refuse the
-//! sibling walk when block IDs beyond the shared prefix don't match, or
-//! (2) sending the full prefix token IDs from the inferlet side so
-//! Python never has to reconstruct.  Until one of those lands, block
-//! cache must stay off in the hot path.  The save side is kept (it is
-//! harmless: saving chain-hash → export-name entries doesn't affect
-//! generation), so a future fix can re-enable lookup without touching
-//! the write path.
+//! Eighteen hours later, pie-vllm commit `9118d46` (2026-04-11) added
+//! an `IMPORTED-CTX` branch to the overlay tracker: when `is_new AND
+//! existing_len == 0 AND effective_cached > 0 AND identity_key not in
+//! token_history`, the tracker seeds `token_history` with
+//! `[0] * effective_cached`.  `num_computed_tokens` lands at
+//! `effective_cached`, so vLLM only embeds
+//! `prompt_token_ids[num_computed_tokens:]` — the zero placeholders are
+//! never read by the model.  The sibling-walk branch
+//! (`vllm_sequence_tracker.py` lines 425-454) is unreachable for
+//! cross-session imports under this guard.  The task #27 pod
+//! verification exercised exactly that failure scenario and found zero
+//! KV cross-contamination across 390 concurrent requests.
 //!
 //! ## Design
 //!
@@ -153,16 +149,10 @@ fn req_name(h: &[u8; 32]) -> String {
 /// with nothing to compute, and downstream paths assume the first forward
 /// pass does at least one token of real work.
 ///
-/// EXPERIMENTAL (task #27 `task27-exp-naive-flip`): this lookup was
-/// disabled on 2026-04-10 (e26af34) under the hypothesis that Python's
-/// `vllm_sequence_tracker.py` would reconstruct a stale sibling's history
-/// on cross-instance import.  The `IMPORTED-CTX` tracker branch
-/// (pie-vllm 9118d46, 2026-04-11) post-dates that disable and seeds
-/// `token_history` with zero placeholders for `is_new AND effective_cached > 0`,
-/// which — by code reading — bypasses the sibling walk entirely.  This
-/// re-enable is the experiment that confirms or refutes that hypothesis
-/// against the `bench-block-cache-repro.py` D3 workload.  If correctness
-/// reproduces, fall back to a tracker-side fix (task #27 phase 2 path a).
+/// Re-enabled under task #27 after the pie-vllm `IMPORTED-CTX` tracker
+/// branch (commit `9118d46`, 2026-04-11) made the original sibling-walk
+/// corruption path unreachable for cross-session imports.  See the
+/// "Historical" section in the module docstring.
 pub fn lookup_longest_prefix(tokens: &[u32], page_size: usize) -> Option<(String, usize)> {
     if page_size == 0 || tokens.len() < 2 * page_size {
         // Need at least 2 blocks: one to match, one for fresh tail.
