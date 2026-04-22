@@ -103,6 +103,24 @@ pub fn parse_ephemeral_header<'a>(
     None
 }
 
+/// Decode the raw base64 string returned by `parse_ephemeral_header` into the
+/// underlying UTF-8 payload. Returns `None` for non-base64 (defense-in-depth;
+/// `parse_ephemeral_header` already validates), non-UTF-8 bytes, or an empty
+/// payload (an empty payload would produce a no-op system message, which is
+/// the same outcome as omitting the header entirely).
+///
+/// Logging discipline (cf. VENDOR_SOURCE.md #4 / #5): callers must NOT log the
+/// returned string. The only allowed sink is `request.messages` mutation +
+/// the chat-template tokenizer. A length-only log behind `.await` is OK.
+pub fn decode_ephemeral_payload(raw_b64: &str) -> Option<String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let bytes = STANDARD.decode(raw_b64).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 #[derive(Deserialize)]
 pub struct ExportRequest {
     pub variant_name: String,
@@ -384,5 +402,41 @@ mod ephemeral_header_tests {
             parse_ephemeral_header(iter(&[("X-Hermes-Ephemeral", "!!!!")])),
             None,
         );
+    }
+}
+
+#[cfg(test)]
+mod ephemeral_decode_tests {
+    use super::*;
+
+    #[test]
+    fn decode_ephemeral_payload_returns_utf8_when_well_formed() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let raw = "user_handle=@alice_demo;reply_to=1.42 rollout slipped";
+        let b64 = STANDARD.encode(raw);
+        assert_eq!(decode_ephemeral_payload(&b64).as_deref(), Some(raw));
+    }
+
+    #[test]
+    fn decode_ephemeral_payload_rejects_non_base64() {
+        assert!(decode_ephemeral_payload("!!!not-base64").is_none());
+    }
+
+    #[test]
+    fn decode_ephemeral_payload_rejects_non_utf8_bytes() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let bytes: &[u8] = &[0xff, 0xfe, 0xfd];
+        let b64 = STANDARD.encode(bytes);
+        assert!(decode_ephemeral_payload(&b64).is_none());
+    }
+
+    #[test]
+    fn decode_ephemeral_payload_rejects_empty_payload() {
+        // Empty base64 decodes to empty bytes which is valid UTF-8, but injecting
+        // an empty system message is a no-op — treat empty as None so callers can
+        // skip the entire mutation path.
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let b64 = STANDARD.encode("");
+        assert!(decode_ephemeral_payload(&b64).is_none());
     }
 }
