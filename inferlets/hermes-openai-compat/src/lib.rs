@@ -45,6 +45,7 @@ use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Method, Request, Response, StatusCode};
 use wstd::io::AsyncRead;
 
+#[cfg(target_family = "wasm")]
 #[wstd::http_server]
 async fn main(mut req: Request<IncomingBody>, res: Responder) -> Finished {
     let path = req.uri().path();
