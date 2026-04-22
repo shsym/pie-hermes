@@ -138,8 +138,43 @@ for wasm32-wasip2.
 
 **Logging discipline:** `parse_ephemeral_header` intentionally returns the
 raw base64 string (not the decoded bytes) so decoded user data never crosses
-the validation boundary via return value. The handler only logs `b64.len()`.
+the validation boundary via return value. The handler no longer logs anything
+on the ephemeral code path — see divergence #5.
 
 **Upstream-worthy:** conditionally. Pieclaw may want a generic OOB-metadata
 header pattern; task #28 can decide at merge time whether to carve the
 helper into a generic `headers.rs` module.
+
+### 5. `eprintln!()` is forbidden in the synchronous prefix of `handle_chat_completions` (Task 1.5-G debug)
+
+**Added:** 2026-04-22, Phase 1.5 Idea G hang debug (pie-hermes).
+
+**Reason:** Calling `eprintln!()` from inside the async
+`handle_chat_completions` handler *before the first `.await`* causes every
+incoming request that reaches the `eprintln` call to hang indefinitely
+under `wstd = 1.0.1` on `wasm32-wasip2`: curl observes HTTP:000 / 0 bytes
+received. The hypothesis is that `std::io::stderr()` on `wasm32-wasip2`
+maps to a blocking WASI call, and invoking it before the executor has
+suspended the task stalls wstd's single-threaded runtime before any
+response bytes are written. Verified empirically via
+`scripts/debug-idea-g.sh`: removing the single `eprintln!(...)` that fired
+when `X-Hermes-Ephemeral` was non-empty turned every hanging step
+(steps 3-7, all >120 s) into a 0-1 s 200 response.
+
+**Constraint documented in code:** the ephemeral code path in
+`src/handler.rs:175-181` carries a comment explaining the prohibition and
+binds the unused `ephemeral_header` with `let _ = &ephemeral_header;` to
+keep the type signature meaningful.
+
+**Existing inherited `eprintln!()` calls:** two pre-existing calls
+(`src/handler.rs:~430` in the constrained-sampler fallback, `~1965` in
+the `export_kv_pages_sync` failure path) fire only in error branches that
+run *after* the handler has suspended on `.await` at least once. They
+have not surfaced this symptom in production on pieclaw; leave them in
+place. Any *new* logging should either (a) happen behind an `.await` or
+(b) use a non-blocking async mechanism.
+
+**Upstream-worthy:** yes, as a documentation change. If pieclaw adds new
+sync-prefix logging to `handle_chat_completions`, they will hit the same
+bug. A proper fix is an async-safe logger; task #28 should mirror this
+note upstream and coordinate on the shared solution.
