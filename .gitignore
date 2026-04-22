@@ -37,6 +37,7 @@ bench/_tmp/
 
 # --- Test output logs (per CLAUDE.md convention: test-YYYYMMDD-HHMMSS.log) ---
 test-*.log
+test-logs/
 
 # --- Capture runs are reproducible artifacts — don't commit them. ---
 captures/runs/*
