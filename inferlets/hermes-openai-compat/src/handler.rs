@@ -436,59 +436,89 @@ fn build_stop_condition<S: StopCondition + 'static>(
 ///
 /// When the request includes `tools`, attempts to build a grammar-constrained
 /// sampler via llguidance that enforces valid tool-call JSON inside
-/// model-specific tool-call markers. Falls back to standard top-p sampling
-/// if constrained sampler construction fails.
+/// model-specific tool-call markers. Falls back to `Model::build_sampler`
+/// (overrides-merged-with-defaults) if constrained sampler construction fails.
+///
+/// Non-grammar path delegates to `Model::build_sampler`, which merges
+/// client-supplied `SamplingOverrides` with the model's
+/// `generation_config.json` defaults (F2 unified sampling). The
+/// `_temperature`/`_top_p` params are unused after A7 — retained for caller
+/// signature stability; will be removed in a follow-up.
 async fn build_sampler(
     model: &inferlet::Model,
     request: &ChatCompletionRequest,
-    temperature: f32,
-    top_p: f32,
+    _temperature: f32,
+    _top_p: f32,
 ) -> Sampler {
+    let overrides = request_to_sampling_overrides(request);
+
     // tool_choice=none → skip constrained decoding entirely
     if matches!(request.tool_choice, ToolChoice::None) {
-        return Sampler::top_p(temperature, top_p);
+        return model.build_sampler(overrides);
     }
 
     if let Some(tools) = &request.tools {
         if !tools.is_empty() {
-            // When tools are present, default to Qwen2.5's
-            // generation_config.json values (rep_penalty=1.05, top_k=20,
-            // top_p=0.8) to match what vLLM auto-injects at load. Without
-            // top_k/top_p, the stochastic draw over the full
-            // grammar-allowed distribution can hit rare tokens and
-            // hallucinate (Phase D1 evidence: turn-0 bogus "1234567890"
-            // integration ID). Clients can override per-request.
-            let rep_penalty = request
+            // Grammar-constrained path. Effective rep_penalty/top_p/top_k come
+            // from the same overrides.or(defaults) merge the SDK uses on the
+            // non-grammar path — so swapping to a non-Qwen model automatically
+            // picks up the new model's generation_config.json values (F2).
+            let defaults = model.generation_defaults();
+            let rep_penalty = overrides
                 .repetition_penalty
-                .filter(|p| p.is_finite() && *p > 0.0)
-                .unwrap_or(1.05);
-            let sampler_top_p = request
+                .or(defaults.repetition_penalty)
+                .unwrap_or(1.0);
+            let top_p_val = overrides
                 .top_p
+                .or(defaults.top_p)
                 .filter(|p| p.is_finite() && *p > 0.0 && *p < 1.0)
-                .unwrap_or(0.8);
-            let sampler_top_k = request
+                .unwrap_or(1.0);
+            let top_k_val = overrides
                 .top_k
+                .or(defaults.top_k)
                 .filter(|k| *k > 0)
-                .unwrap_or(20);
+                .unwrap_or(0);
+            let temperature_val = overrides
+                .temperature
+                .or(defaults.temperature)
+                .unwrap_or(1.0);
             match build_tool_call_sampler(
                 model,
                 tools,
                 &request.tool_choice,
-                temperature,
+                temperature_val,
                 rep_penalty,
-                sampler_top_p,
-                sampler_top_k,
+                top_p_val,
+                top_k_val,
             )
             .await
             {
                 Ok(s) => return s,
                 Err(e) => {
-                    eprintln!("[WARN] Failed to build constrained sampler: {e}. Falling back to top_p.");
+                    eprintln!("[WARN] Failed to build constrained sampler: {e}. Falling back to model.build_sampler.");
                 }
             }
         }
     }
-    Sampler::top_p(temperature, top_p)
+    model.build_sampler(overrides)
+}
+
+/// Map a `ChatCompletionRequest`'s client-supplied sampling fields into the
+/// SDK's `SamplingOverrides` struct (F2 unified sampling). Any field the
+/// request type doesn't carry (min_p, frequency_penalty, presence_penalty)
+/// is plumbed as `None`; the SDK then falls back to model defaults.
+fn request_to_sampling_overrides(
+    request: &ChatCompletionRequest,
+) -> inferlet::SamplingOverrides {
+    inferlet::SamplingOverrides {
+        temperature:        request.temperature,
+        top_p:              request.top_p,
+        top_k:              request.top_k,
+        min_p:              None,
+        repetition_penalty: request.repetition_penalty,
+        frequency_penalty:  None,
+        presence_penalty:   None,
+    }
 }
 
 /// Build a grammar-constrained sampler for tool-call generation.
@@ -2240,5 +2270,47 @@ mod incremental_detokenize_tests {
         let (d, p, r) = incremental_detokenize_step(fake_chinese_split, &ids, 1, 2);
         assert_eq!(d, "");
         assert_eq!((p, r), (1, 2));
+    }
+}
+
+#[cfg(test)]
+mod build_sampler_tests {
+    use super::*;
+    use crate::types::ChatCompletionRequest;
+
+    #[test]
+    fn overrides_from_request_are_none_when_absent() {
+        let req = ChatCompletionRequest {
+            temperature: Some(0.5),
+            top_p: None,
+            top_k: None,
+            ..Default::default()
+        };
+        let o = request_to_sampling_overrides(&req);
+        assert_eq!(o.temperature, Some(0.5));
+        assert_eq!(o.top_p, None);
+        assert_eq!(o.top_k, None);
+        assert_eq!(o.repetition_penalty, None);
+        // Fields absent from ChatCompletionRequest must plumb as None so the
+        // SDK merge falls through to model.generation_defaults().
+        assert_eq!(o.min_p, None);
+        assert_eq!(o.frequency_penalty, None);
+        assert_eq!(o.presence_penalty, None);
+    }
+
+    #[test]
+    fn overrides_preserve_client_values() {
+        let req = ChatCompletionRequest {
+            temperature: Some(0.7),
+            top_p: Some(0.95),
+            top_k: Some(40),
+            repetition_penalty: Some(1.1),
+            ..Default::default()
+        };
+        let o = request_to_sampling_overrides(&req);
+        assert_eq!(o.temperature, Some(0.7));
+        assert_eq!(o.top_p, Some(0.95));
+        assert_eq!(o.top_k, Some(40));
+        assert_eq!(o.repetition_penalty, Some(1.1));
     }
 }

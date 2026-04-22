@@ -11,7 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 wstd = "0.5.6"
-inferlet = { path = "../../pie-vllm/pie/sdk/rust/inferlet" }
+inferlet = { path = "../../../pie/sdk/rust/inferlet" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 minijinja = "2"
