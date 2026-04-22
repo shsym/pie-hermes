@@ -79,11 +79,25 @@ def _json_fallback(obj: Any) -> Any:
 
 
 def _scrub_kwargs(kwargs: dict) -> dict:
-    """Strip fields we don't want in captures (none today) and return a
-    JSON-safe copy."""
+    """Strip fields we don't want in captures, keep pie-hermes bookkeeping.
+
+    extra_headers can contain auth tokens, so we drop it by default — but
+    keep a ``hermes_headers`` summary of any ``X-Hermes-*`` keys (plus the
+    base64 length of ephemeral payloads). That's the minimum needed to
+    verify Phase-1 optimizers actually emitted headers on the wire without
+    leaking credentials.
+    """
     out = {}
     for k, v in kwargs.items():
-        if k in {"extra_headers"}:
+        if k == "extra_headers":
+            if isinstance(v, dict):
+                summary = {
+                    name: (len(val) if name.lower() == "x-hermes-ephemeral" and isinstance(val, str) else val)
+                    for name, val in v.items()
+                    if isinstance(name, str) and name.lower().startswith("x-hermes-")
+                }
+                if summary:
+                    out["hermes_headers"] = summary
             continue
         out[k] = v
     return out

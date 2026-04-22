@@ -1,3 +1,11 @@
 [submodule "hermes-agent"]
 	path = hermes-agent
 	url = https://github.com/shsym/hermes-agent.git
+	# Suppress untracked-file noise in the outer `git status` — the fork's
+	# test suite and editable install drop artifacts (tests/test_data/,
+	# __pycache__, etc.) that we never want to commit from the outer repo.
+	ignore = untracked
+[submodule "pie-vllm"]
+	path = pie-vllm
+	url = https://github.com/shsym/pie-vllm.git
+	ignore = untracked

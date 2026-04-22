@@ -1,0 +1,35 @@
+[package]
+name = "hermes-openai-compat"
+version = "0.1.0"
+edition = "2024"
+description = "Hermes-specific OpenAI-compatible inferlet for pie (vendored from openai-compat-v2; diverges with variant KV / skill_view / read_context / OOB metadata)"
+
+[lib]
+# rlib added so `cargo test --target <host>` can link the crate for
+# unit tests. cdylib remains the build product for wasm32-wasip2.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wstd = "0.5.6"
+inferlet = { path = "../../pie-vllm/pie/sdk/rust/inferlet" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+minijinja = "2"
+sha2 = "0.10"
+hex = "0.4"
+llguidance = { version = "1.1.1", default-features = false, features = ["lark"] }
+fancy-regex = "0.15.0"
+once_cell = "1.21"
+# Used by variant::parse_ephemeral_header to validate X-Hermes-Ephemeral
+# payloads are well-formed base64. default-features = false keeps wasm32-wasip2
+# builds lean — only `alloc` + `std` are needed for STANDARD decode.
+base64 = { version = "0.22", default-features = false, features = ["alloc", "std"] }
+# Pin wasip2 to 1.0.1 (wasi-0.2.4) — wstd 0.5.6 resolves to wasip2 1.0.2
+# (wasi-0.2.9) which is newer than the Pie runtime's wasmtime-wasi 41.x
+# (wasi-0.2.4). Mismatched WASI versions cause "not found in linker" errors
+# because inferlet:core/forward references wasi:io/poll@0.2.4.pollable but
+# the WASM component imports wasi:io/poll@0.2.9.
+wasip2 = "=1.0.1"
+
+[profile.release]
+lto = true
