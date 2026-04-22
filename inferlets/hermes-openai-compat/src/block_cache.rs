@@ -1,8 +1,20 @@
 //! Block-level prefix cache inside the inferlet.
 //!
+//! ## STATUS (task #27, branch `task27-exp-naive-flip`)
+//!
+//! `lookup_longest_prefix` is **re-enabled** on this branch.  The
+//! ⚠️ DISABLED rationale below is kept verbatim as the original bug
+//! hypothesis; the task #27 naive-flip experiment tests whether the
+//! `IMPORTED-CTX` branch added to pie-vllm's `vllm_sequence_tracker.py`
+//! (commit 9118d46, 2026-04-11, ~18 hours AFTER the 2026-04-10 disable
+//! below) already handles the sibling-walk corruption.  If the D3
+//! reproducer at `scripts/bench-block-cache-repro.py` stays clean at
+//! c=1/4/8/16, this flip is the shipping change.  If it reproduces, we
+//! fall back to task #27 phase 2 path (a) — tracker-side fix.
+//!
 //! ## ⚠️ DISABLED — cross-instance history reconstruction is broken
 //!
-//! `lookup_longest_prefix` currently returns `None` unconditionally.
+//! `lookup_longest_prefix` previously returned `None` unconditionally.
 //! Measured behavior on D3 + D1-warmup (fresh A40 pod, 2026-04-10):
 //!
 //! - req0/req1/req3 are coherent, but **req2 is semantically off**
@@ -134,9 +146,53 @@ fn req_name(h: &[u8; 32]) -> String {
 ///
 /// We stop at the first miss.  Gap-and-resume is not worth the SDK
 /// complexity (mixed import + compute mid-context is not supported).
-pub fn lookup_longest_prefix(_tokens: &[u32], _page_size: usize) -> Option<(String, usize)> {
-    // Disabled — see the ⚠️ note at the top of this module.
-    None
+///
+/// The deepest match is capped at `num_blocks - 1` so the caller always
+/// has at least `page_size` tokens of fresh tail to re-prefill through
+/// the model.  Importing the entire request would leave `ctx.fill_tokens`
+/// with nothing to compute, and downstream paths assume the first forward
+/// pass does at least one token of real work.
+///
+/// EXPERIMENTAL (task #27 `task27-exp-naive-flip`): this lookup was
+/// disabled on 2026-04-10 (e26af34) under the hypothesis that Python's
+/// `vllm_sequence_tracker.py` would reconstruct a stale sibling's history
+/// on cross-instance import.  The `IMPORTED-CTX` tracker branch
+/// (pie-vllm 9118d46, 2026-04-11) post-dates that disable and seeds
+/// `token_history` with zero placeholders for `is_new AND effective_cached > 0`,
+/// which — by code reading — bypasses the sibling walk entirely.  This
+/// re-enable is the experiment that confirms or refutes that hypothesis
+/// against the `bench-block-cache-repro.py` D3 workload.  If correctness
+/// reproduces, fall back to a tracker-side fix (task #27 phase 2 path a).
+pub fn lookup_longest_prefix(tokens: &[u32], page_size: usize) -> Option<(String, usize)> {
+    if page_size == 0 || tokens.len() < 2 * page_size {
+        // Need at least 2 blocks: one to match, one for fresh tail.
+        return None;
+    }
+    let num_blocks = tokens.len() / page_size;
+    let max_cached_pages = num_blocks - 1;
+
+    let mut chain = [0u8; 32];
+    let mut best: Option<(String, usize)> = None;
+    for i in 0..num_blocks {
+        let block = &tokens[i * page_size..(i + 1) * page_size];
+        chain = chain_hash(&chain, block);
+        let key = blk_key(&chain);
+        let Some(json) = inferlet::store_get(&key) else {
+            break;
+        };
+        let Ok(entry) = serde_json::from_str::<LookupEntry>(&json) else {
+            break;
+        };
+        let capped_pages = entry.pages.min(max_cached_pages);
+        if capped_pages > 0 {
+            best = Some((entry.req, capped_pages));
+        }
+        // Deeper blocks can't beat the cap — stop walking.
+        if entry.pages >= max_cached_pages {
+            break;
+        }
+    }
+    best
 }
 
 /// Save the current context's prefill blocks into the block cache.

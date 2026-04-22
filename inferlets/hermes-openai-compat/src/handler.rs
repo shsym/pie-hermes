@@ -342,12 +342,15 @@ pub async fn handle_chat_completions(
     // Skip session KV save for fork path — forked contexts are ephemeral.
     // Future: export winning fork's KV.
     if fork_meta.is_none() {
-        // block_cache::lookup_longest_prefix is permanently disabled (see module
-        // docstring); it only writes entries that nothing ever reads back.  Until
-        // the lookup side is restored, skip block_cache save entirely so session
-        // KV retention actually persists across turns.  The old short-circuit
-        // ("if block save did anything, skip session_kv") left session state
-        // unwritten whenever block_cache ran — breaking multi-turn KV reuse.
+        // Both stores run unconditionally on this experimental branch (task #27
+        // naive flip).  The previous short-circuit ("if block save did
+        // anything, skip session_kv") broke multi-turn KV reuse.
+        // save_ctx_blocks's final-block fast-path (skip re-export if the entry
+        // already exists) keeps the hot path cheap.
+        if let Some(ref bc_tokens) = session_incoming_tokens {
+            let page_size = model.get_kv_page_size() as usize;
+            let _ = crate::block_cache::save_ctx_blocks(&ctx, bc_tokens, page_size);
+        }
         save_session_kv_state(&ctx, &request, session_incoming_tokens.as_deref());
     }
 
@@ -978,9 +981,13 @@ async fn handle_streaming(
     }
 
     // Save block-level cache entries from this request's context.
-        // Block-cache lookup is disabled (see block_cache.rs top-of-module note),
-    // so skip block_cache save too — it would short-circuit session_kv save
-    // and break multi-turn KV reuse.  Mirror of the non-streaming path above.
+    // Both stores run unconditionally on this experimental branch (task #27
+    // naive flip).  save_ctx_blocks's final-block fast-path keeps the hot
+    // path cheap.  Mirror of the non-streaming path above.
+    if let Some(ref bc_tokens) = session_incoming_tokens {
+        let page_size = model.get_kv_page_size() as usize;
+        let _ = crate::block_cache::save_ctx_blocks(&ctx, bc_tokens, page_size);
+    }
     save_session_kv_state(&ctx, request, session_incoming_tokens.as_deref());
 
     // [Phase-B instrumentation] Emit the raw generated text as an SSE
