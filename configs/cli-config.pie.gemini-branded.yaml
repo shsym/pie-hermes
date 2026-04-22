@@ -1,11 +1,14 @@
-# Hermes CLI config for running against a pie openai-compat-v2 endpoint.
+# Phase-1 variant: Gemini-branded self-reported model identity.
 #
-# Used by task #22 to capture real prompt/token numbers from Hermes when
-# routed through pie on runpod (model: Qwen2.5-72B-Instruct-AWQ).
+# Same pod, same inferlet, same served model (Qwen2.5-72B-AWQ) — but the
+# client self-reports model.default as "stub-gemini-2.5-for-measurement" so
+# hermes-agent's _build_system_prompt injects GOOGLE_MODEL_OPERATIONAL_GUIDANCE
+# (triggered by the "gemini" substring match). Used by Task 1V.5 to measure
+# the Idea-A savings ceiling — without this, Qwen doesn't match any of the
+# five TOOL_USE_ENFORCEMENT_MODELS entries and the GOOGLE guidance block
+# never appears, making the variant-KV swap untestable at full scale.
 #
-# Base URL is intentionally a placeholder — replace with the live pod URL
-# before starting the session. cli-config.pie.local.yaml is the gitignored
-# variant that holds the real URL for a given run.
+# Select via: HERMES_CONFIG_PATH=configs/cli-config.pie.gemini-branded.yaml ./scripts/run_in_container.sh
 
 model:
   default: "stub-gemini-2.5-for-measurement"
