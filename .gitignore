@@ -41,3 +41,6 @@ test-logs/
 
 # --- Capture runs are reproducible artifacts — don't commit them. ---
 captures/runs/*
+
+# --- Plans / working docs — local only (CLAUDE.md: "don't commit docs") ---
+docs/
