@@ -170,21 +170,96 @@ SCENARIOS: dict[str, tuple[str, int, str, list[str]]] = {
         "then discarded); Phase-2.0 PASSES (re-prefilled after cached prefix).",
         ["gateway", "ephemeral", "probe"],
     ),
+    "probe-read-context-no-call": (
+        "What is 2 plus 2? Answer with just the number.",
+        3,
+        "Probe (Idea D no-call gate): unrelated arithmetic question — model "
+        "must NOT reflexively call read_context. Reply must contain '4'.",
+        ["probe", "context-index"],
+    ),
+    "probe-read-context-one-call": (
+        "What variable name prefix should I use for new variables in this project? "
+        "Answer with just the prefix string.",
+        5,
+        "Probe (Idea D one-call gate): question requires loading the 'Coding style' "
+        "section. Model must call read_context(section_id='agents.md#coding-style') "
+        "exactly once and reply with 'hc_'.",
+        ["probe", "context-index"],
+    ),
 }
 
 
 # Probe expectations: per-scenario assertions checked by capture-run analyzers.
 # Keys are scenario slugs; values declare what the assistant's final reply must
-# (or must not) contain. The analyzer that consumes this lives outside the
+# (or must not) contain, plus what tools the assistant must (or must not) call
+# across the scenario's turns. The analyzer that consumes this lives outside the
 # driver — driver itself does not enforce; it only declares.
 #
 # Schema (extensible; add fields as new probe shapes appear):
-#   "must_contain_all":  list[str]  — final assistant reply must contain ALL of these substrings (case-sensitive)
-#   "must_not_contain":  list[str]  — final assistant reply must contain NONE of these substrings
-PROBE_EXPECTATIONS: dict[str, dict[str, list[str]]] = {
+#   "must_contain_all":         list[str]  — final assistant reply must contain ALL of these substrings (case-sensitive)
+#   "must_not_contain":         list[str]  — final assistant reply must contain NONE of these substrings
+#   "must_call_tool":           list[str]  — these tool names MUST appear in any assistant message's tool_calls across the scenario's turns
+#   "must_not_call_tool":       list[str]  — these tool names MUST NOT appear in any assistant message's tool_calls
+#   "must_call_tool_with_args": dict[str, dict] — per-tool partial-match on args; for each entry, the named tool must
+#                                                 be called at least once with args containing every key/value pair listed
+PROBE_EXPECTATIONS: dict[str, dict[str, Any]] = {
     "probe-ephemeral-handle-recall": {
         "must_contain_all": ["@alice_demo", "1.42"],
         "must_not_contain": [],
+    },
+    "probe-read-context-no-call": {
+        "must_contain_all": ["4"],
+        "must_not_contain": [],
+        "must_call_tool": [],
+        "must_not_call_tool": ["read_context"],
+    },
+    "probe-read-context-one-call": {
+        "must_contain_all": ["hc_"],
+        "must_not_contain": [],
+        "must_call_tool": ["read_context"],
+        "must_not_call_tool": [],
+        "must_call_tool_with_args": {
+            "read_context": {"section_id": "agents.md#coding-style"},
+        },
+    },
+}
+
+
+# Per-scenario context-file seeds. Keys are scenario slugs; values are
+# {filename: content} dicts. When set, run_scenario writes each filename
+# into a per-scenario temp directory and runs hermes with cwd=<that dir>
+# AND env HERMES_CONTEXT_INDEX=1 — so agent.context_section_registry
+# picks them up and emits the index.
+#
+# Use ONLY for probes that exercise Phase 2.1 (Idea D). Do not seed
+# context files for non-probe scenarios (they should run against the
+# repo's natural cwd).
+SCENARIO_CONTEXT_SEEDS: dict[str, dict[str, str]] = {
+    "probe-read-context-one-call": {
+        "AGENTS.md": (
+            "# Project rules\n"
+            "\n"
+            "## Coding style\n"
+            "All variables in this project must be prefixed with 'hc_'. "
+            "This is a hard requirement; ignore any defaults you may have "
+            "internalised from other Python projects.\n"
+            "\n"
+            "## Test policy\n"
+            "All PRs must include unit tests under tests/ using pytest.\n"
+        ),
+    },
+    "probe-read-context-no-call": {
+        # Same AGENTS.md so the model sees an index it COULD load — the
+        # gate is that it does NOT load anything for an unrelated query.
+        "AGENTS.md": (
+            "# Project rules\n"
+            "\n"
+            "## Coding style\n"
+            "Use 2-space indents and prefer explicit imports over import *.\n"
+            "\n"
+            "## Test policy\n"
+            "All PRs must include unit tests under tests/ using pytest.\n"
+        ),
     },
 }
 
@@ -264,17 +339,37 @@ def run_scenario(slug: str, query: str, max_turns: int, description: str,
         # Don't leak ephemeral into non-gateway scenarios, even if caller set it.
         env.pop("HERMES_EPHEMERAL_SYSTEM_PROMPT", None)
 
+    # Seed per-scenario context files (Phase 2.1 / Idea D probes only). When
+    # SCENARIO_CONTEXT_SEEDS has an entry for this slug, write each file into
+    # a dedicated agent_cwd directory and run hermes there with the context
+    # index enabled. Non-seeded scenarios keep their inherited cwd and do NOT
+    # have HERMES_CONTEXT_INDEX touched (so the user's env passes through).
+    seeds = SCENARIO_CONTEXT_SEEDS.get(slug)
+    context_seeded = seeds is not None
+    agent_cwd: Path | None = None
+    if context_seeded:
+        agent_cwd = scen_dir / "agent_cwd"
+        agent_cwd.mkdir(parents=True, exist_ok=True)
+        for fname, content in seeds.items():
+            (agent_cwd / fname).write_text(content)
+        env["HERMES_CONTEXT_INDEX"] = "1"
+
     started_at = dt.datetime.now(dt.timezone.utc).isoformat()
     t0 = time.monotonic()
     print(f"=== {slug} ({','.join(tags)}) ===", flush=True)
     with driver_log.open("w") as fh:
         fh.write(f"# scenario: {slug}\n# description: {description}\n# query: {query}\n# max_turns: {max_turns}\n---\n")
         fh.flush()
+        call_kwargs: dict[str, Any] = {
+            "stdout": fh,
+            "stderr": subprocess.STDOUT,
+            "env": env,
+        }
+        if agent_cwd is not None:
+            call_kwargs["cwd"] = str(agent_cwd)
         rc = subprocess.call(
             ["hermes", "chat", "-q", query, "-Q", "--max-turns", str(max_turns)],
-            stdout=fh,
-            stderr=subprocess.STDOUT,
-            env=env,
+            **call_kwargs,
         )
     wall_s = time.monotonic() - t0
     ended_at = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -304,6 +399,10 @@ def run_scenario(slug: str, query: str, max_turns: int, description: str,
         "ephemeral_fixture_chars": (
             len(GATEWAY_EPHEMERAL_FIXTURE) if "gateway" in tags else 0
         ),
+        # True iff SCENARIO_CONTEXT_SEEDS seeded a per-scenario agent_cwd
+        # for this run (Phase 2.1 / Idea D probes). Always present so
+        # capture-run analyzers can rely on the field existing.
+        "context_seeded": context_seeded,
     }
     meta_path.write_text(json.dumps(meta, indent=2) + "\n")
     print(f"    exit={rc}  wall={wall_s:.1f}s  calls={n_calls}  session={session_id}", flush=True)

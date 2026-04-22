@@ -74,3 +74,102 @@ def test_probe_must_contain_strings_actually_appear_in_fixture_for_handle_recall
         assert substr in GATEWAY_EPHEMERAL_FIXTURE, (
             f"Probe expects model to mention {substr!r}, but it's not in the fixture"
         )
+
+
+# -----------------------------------------------------------------------------
+# Phase 2.1 / Idea D — read_context probe scenarios
+# -----------------------------------------------------------------------------
+
+def test_probe_read_context_no_call_present():
+    assert "probe-read-context-no-call" in SCENARIOS
+    _, _, _, tags = SCENARIOS["probe-read-context-no-call"]
+    assert "probe" in tags
+    assert "context-index" in tags
+
+
+def test_probe_read_context_one_call_present():
+    assert "probe-read-context-one-call" in SCENARIOS
+    _, _, _, tags = SCENARIOS["probe-read-context-one-call"]
+    assert "probe" in tags
+    assert "context-index" in tags
+
+
+def test_probe_read_context_no_call_seeded():
+    from bench.driver import SCENARIO_CONTEXT_SEEDS
+    assert "probe-read-context-no-call" in SCENARIO_CONTEXT_SEEDS
+    assert "AGENTS.md" in SCENARIO_CONTEXT_SEEDS["probe-read-context-no-call"]
+
+
+def test_probe_read_context_one_call_seeded():
+    from bench.driver import SCENARIO_CONTEXT_SEEDS
+    assert "probe-read-context-one-call" in SCENARIO_CONTEXT_SEEDS
+    assert "AGENTS.md" in SCENARIO_CONTEXT_SEEDS["probe-read-context-one-call"]
+
+
+def test_probe_read_context_no_call_expectations():
+    from bench.driver import PROBE_EXPECTATIONS
+    spec = PROBE_EXPECTATIONS["probe-read-context-no-call"]
+    assert spec["must_not_call_tool"] == ["read_context"]
+    assert spec["must_contain_all"] == ["4"]
+
+
+def test_probe_read_context_one_call_expectations():
+    from bench.driver import PROBE_EXPECTATIONS
+    spec = PROBE_EXPECTATIONS["probe-read-context-one-call"]
+    assert spec["must_call_tool"] == ["read_context"]
+    assert spec["must_call_tool_with_args"]["read_context"]["section_id"] == (
+        "agents.md#coding-style"
+    )
+    assert spec["must_contain_all"] == ["hc_"]
+
+
+def test_one_call_seed_actually_contains_hc_prefix():
+    """Without 'hc_' in the AGENTS.md, the answer isn't derivable from the
+    seed and the probe loses its diagnostic value. Lock the fixture in."""
+    from bench.driver import SCENARIO_CONTEXT_SEEDS
+    content = SCENARIO_CONTEXT_SEEDS["probe-read-context-one-call"]["AGENTS.md"]
+    assert "hc_" in content
+
+
+def test_no_call_seed_does_not_contain_4_so_baseline_can_answer():
+    """The no-call seed must NOT contain the answer to '2+2' — otherwise the
+    model could plausibly cheat by loading the section. The whole point of
+    this probe is that the model answers from its own knowledge without
+    touching read_context. Lock that in."""
+    from bench.driver import SCENARIO_CONTEXT_SEEDS
+    content = SCENARIO_CONTEXT_SEEDS["probe-read-context-no-call"]["AGENTS.md"]
+    lower = content.lower()
+    assert "2 plus 2" not in lower
+    assert "4" not in content
+    assert "two" not in lower
+
+
+def test_every_probe_expectation_has_known_keys():
+    """Catch typos in PROBE_EXPECTATIONS keys. Every key in every entry's
+    value-dict must be one of the documented schema keys."""
+    from bench.driver import PROBE_EXPECTATIONS
+    known = {
+        "must_contain_all",
+        "must_not_contain",
+        "must_call_tool",
+        "must_not_call_tool",
+        "must_call_tool_with_args",
+    }
+    for slug, spec in PROBE_EXPECTATIONS.items():
+        unknown = set(spec.keys()) - known
+        assert not unknown, (
+            f"Probe {slug!r} has unknown expectation keys: {unknown}"
+        )
+
+
+def test_every_seeded_scenario_is_a_probe():
+    """Seeds are an opt-in probe affordance. Non-probe scenarios shouldn't be
+    silently seeded — that would change the cwd they run under and break
+    comparability with prior captures."""
+    from bench.driver import SCENARIO_CONTEXT_SEEDS
+    for slug in SCENARIO_CONTEXT_SEEDS:
+        assert slug in SCENARIOS, f"Seeded slug {slug!r} not in SCENARIOS"
+        _, _, _, tags = SCENARIOS[slug]
+        assert "probe" in tags, (
+            f"Seeded scenario {slug!r} is missing the 'probe' tag"
+        )
