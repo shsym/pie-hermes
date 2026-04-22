@@ -24,7 +24,8 @@ def test_install_registers_composite_optimizer():
     reset_default()
 
 
-def test_installed_optimizer_strips_variant_blocks():
+def test_installed_optimizer_leaves_enforcement_alone_when_variant_is_none():
+    """No GPT/Gemini block in parts → variant='none', no stripping (inferlet no-op)."""
     from agent.prompt_optimizer import get, reset_default
     from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
     from bench.install_optimizers import install
@@ -39,13 +40,87 @@ def test_installed_optimizer_strips_variant_blocks():
         ])
     finally:
         reset_default()
-    # TOOL_USE_ENFORCEMENT_GUIDANCE should be gone from parts.
-    assert TOOL_USE_ENFORCEMENT_GUIDANCE not in result.parts
-    # The remaining parts are the non-variant blocks, in order.
-    assert result.parts == ["identity block", "timestamp"]
-    # Header should request the matching variant — "none" since the Qwen-like
-    # current model doesn't trigger GPT or Gemini blocks.
+    # Qwen-shape input: TOOL_USE only, no branded blocks.
+    # Correct behavior: pass through; emit "none" variant for telemetry.
+    assert result.parts == ["identity block", TOOL_USE_ENFORCEMENT_GUIDANCE, "timestamp"]
     assert result.extra_headers.get("X-Hermes-Variant") == "none"
+
+
+def test_codex_variant_strips_both_openai_and_enforcement_blocks():
+    from agent.prompt_optimizer import get, reset_default
+    from agent.prompt_builder import (
+        TOOL_USE_ENFORCEMENT_GUIDANCE,
+        OPENAI_MODEL_EXECUTION_GUIDANCE,
+    )
+    from bench.install_optimizers import install
+
+    reset_default()
+    install()
+    try:
+        result = get().optimize([
+            "identity",
+            TOOL_USE_ENFORCEMENT_GUIDANCE,
+            OPENAI_MODEL_EXECUTION_GUIDANCE,
+            "timestamp",
+        ])
+    finally:
+        reset_default()
+    assert TOOL_USE_ENFORCEMENT_GUIDANCE not in result.parts
+    assert OPENAI_MODEL_EXECUTION_GUIDANCE not in result.parts
+    assert result.parts == ["identity", "timestamp"]
+    assert result.extra_headers.get("X-Hermes-Variant") == "codex"
+
+
+def test_google_variant_strips_both_google_and_enforcement_blocks():
+    from agent.prompt_optimizer import get, reset_default
+    from agent.prompt_builder import (
+        TOOL_USE_ENFORCEMENT_GUIDANCE,
+        GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+    )
+    from bench.install_optimizers import install
+
+    reset_default()
+    install()
+    try:
+        result = get().optimize([
+            "identity",
+            TOOL_USE_ENFORCEMENT_GUIDANCE,
+            GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+            "timestamp",
+        ])
+    finally:
+        reset_default()
+    assert TOOL_USE_ENFORCEMENT_GUIDANCE not in result.parts
+    assert GOOGLE_MODEL_OPERATIONAL_GUIDANCE not in result.parts
+    assert result.parts == ["identity", "timestamp"]
+    assert result.extra_headers.get("X-Hermes-Variant") == "google"
+
+
+def test_codex_wins_over_google_when_both_present():
+    """Defensive: hermes-agent shouldn't emit both, but if it ever does,
+    precedence is defined (openai first)."""
+    from agent.prompt_optimizer import get, reset_default
+    from agent.prompt_builder import (
+        TOOL_USE_ENFORCEMENT_GUIDANCE,
+        OPENAI_MODEL_EXECUTION_GUIDANCE,
+        GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+    )
+    from bench.install_optimizers import install
+
+    reset_default()
+    install()
+    try:
+        result = get().optimize([
+            TOOL_USE_ENFORCEMENT_GUIDANCE,
+            OPENAI_MODEL_EXECUTION_GUIDANCE,
+            GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+        ])
+    finally:
+        reset_default()
+    # Both should be stripped + header goes to codex.
+    assert OPENAI_MODEL_EXECUTION_GUIDANCE not in result.parts
+    assert GOOGLE_MODEL_OPERATIONAL_GUIDANCE not in result.parts
+    assert result.extra_headers.get("X-Hermes-Variant") == "codex"
 
 
 def test_composite_ephemeral_is_passthrough_for_now():
