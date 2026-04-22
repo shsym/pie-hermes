@@ -72,3 +72,44 @@ existing `/v1/debug/kv-exports` route.
 generic "KV pre-population" utility; the specifics of variant-naming are
 pie-hermes business. Task #28 can decide at merge time whether to upstream
 the route skeleton + make the handle namespace client-configurable.
+
+### 3. `X-Hermes-Variant` header → variant-KV injection (Task 1A.3)
+
+**Added:** 2026-04-22, Task 1A.3 (pie-hermes Phase 1).
+
+**Reason:** Closes the loop from Task 1A.2's export route.  When a
+`POST /v1/chat/completions` request arrives with `X-Hermes-Variant: codex`
+or `X-Hermes-Variant: google`, the handler short-circuits to a new
+`prepare_variant_execution` path that:
+
+1. Loads `VariantMetadata` (token_ids + kv_page_last_len) from the
+   persistent store at key `v1.variant.<name>.meta`.
+2. Calls `queue.import_kv_pages("hermes-variant-<name>")` to import the
+   pre-exported pages.
+3. Constructs a Context via `Context::from_imported_state(model, kv_pages,
+   token_ids, kv_page_last_len)` — the variant prefix is already in GPU KV
+   cache, so those tokens cost zero prefill FLOPs.
+4. Appends only the chat-specific tail via `ctx.fill_tokens(chat_tokens)`.
+
+The `VariantMetadata` type and `save_metadata`/`load_metadata` helpers are
+in `src/variant.rs` (same file as the export route).  `handle_export` now
+calls `save_metadata` after a successful `export_resource_sync`, so export
+and import metadata stay in sync.
+
+**Phase-1 scope limitation:** applies ONLY to the non-session,
+non-registered-prefix path.  When the request has `pie_session` or
+`pie_prompt.mode == "registered_prefix"`, the existing path is used
+unchanged.  Coexisting variant + session KV semantics on turn 2+ require
+storing the variant tokens in session state and re-matching against them on
+subsequent turns — deferred to a later phase.  Session-ID auto-derivation
+(from bearer + system prompt) is also skipped when the variant header is
+present, to ensure variant requests always land on the non-session path.
+
+**Surface:** `src/variant.rs` (VariantMetadata, save/load_metadata,
+parse_variant_header), `src/handler.rs` (prepare_variant_execution,
+updated prepare_execution signature, updated handle_chat_completions),
+`src/lib.rs` (variant_header extraction + wiring).
+
+**Upstream-worthy:** the generic `from_imported_state` usage pattern and
+the `parse_variant_header` helper are reusable; the specific variant
+names/store keys are pie-hermes business.  Task #28 decides at merge time.
