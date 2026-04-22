@@ -134,3 +134,39 @@ def test_composite_ephemeral_is_passthrough_for_now():
     result = comp.optimize(["a", "b"])
     assert result.parts == ["a", "b"]
     assert result.extra_headers == {}
+
+
+def test_install_also_registers_ephemeral_router():
+    from agent.prompt_optimizer import (
+        get_ephemeral_router, reset_ephemeral_router, IdentityEphemeralRouter,
+    )
+    from bench.install_optimizers import install
+
+    reset_ephemeral_router()
+    assert isinstance(get_ephemeral_router(), IdentityEphemeralRouter)
+    install()
+    try:
+        router = get_ephemeral_router()
+        assert not isinstance(router, IdentityEphemeralRouter)
+        reduced, headers = router.route("chat_id=123\nuser=alice")
+        assert reduced is None
+        assert "X-Hermes-Ephemeral" in headers
+        # Round-trip the base64 to prove it's the original text.
+        import base64
+        assert (
+            base64.b64decode(headers["X-Hermes-Ephemeral"]).decode("utf-8")
+            == "chat_id=123\nuser=alice"
+        )
+    finally:
+        reset_ephemeral_router()
+
+
+def test_ephemeral_router_empty_text_returns_no_headers():
+    from agent.prompt_optimizer import reset_ephemeral_router
+    from bench.optimizers.ephemeral_oob import EphemeralOOBRouter
+
+    reset_ephemeral_router()
+    r = EphemeralOOBRouter()
+    reduced, headers = r.route("")
+    assert reduced is None
+    assert headers == {}
