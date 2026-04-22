@@ -166,6 +166,7 @@ pub async fn handle_chat_completions(
     n_candidates: usize,
     session_id_header: Option<String>,
     auth_bearer: String,
+    variant_header: Option<String>,
 ) -> Finished {
     let t_entry = std::time::Instant::now();
     let body_len = body_bytes.len();
@@ -203,7 +204,12 @@ pub async fn handle_chat_completions(
     // Tiers 2 and 3 both require a non-empty bearer token; unauthenticated
     // callers fall through to the non-session path rather than share a bucket
     // keyed only on a guessable system prompt.
-    if request.pie_session.is_none() {
+    //
+    // Phase-1 scope: when X-Hermes-Variant is set, skip session-id derivation
+    // entirely so the request uses the non-session path.  Coexisting variant +
+    // session KV semantics on turn 2+ require storing variant tokens in session
+    // state — deferred to a later phase.
+    if request.pie_session.is_none() && variant_header.is_none() {
         let session_id = session_id_header
             .as_deref()
             .and_then(|raw| scoped_session_id(&auth_bearer, raw))
@@ -227,7 +233,7 @@ pub async fn handle_chat_completions(
     let temperature = request.temperature.unwrap_or(0.7);
     let top_p = request.top_p.unwrap_or(1.0);
 
-    let prepared = match prepare_execution(&request).await {
+    let prepared = match prepare_execution(&request, variant_header.as_deref()).await {
         Ok(prepared) => prepared,
         Err(message) => {
             return crate::error_response(responder, 400, &message).await;
@@ -1041,7 +1047,10 @@ struct PreparedExecution {
     session_incoming_tokens: Option<Vec<u32>>,
 }
 
-async fn prepare_execution(request: &ChatCompletionRequest) -> Result<PreparedExecution, String> {
+async fn prepare_execution(
+    request: &ChatCompletionRequest,
+    variant_header: Option<&str>,
+) -> Result<PreparedExecution, String> {
     let t_start = std::time::Instant::now();
     let model = inferlet::get_auto_model();
 
@@ -1060,6 +1069,15 @@ async fn prepare_execution(request: &ChatCompletionRequest) -> Result<PreparedEx
     if let Some(pie_prompt) = &request.pie_prompt {
         if pie_prompt.mode == "registered_prefix" {
             return prepare_structured_execution(&model, request, pie_prompt).await;
+        }
+    }
+
+    // Phase-1 Idea A: variant-KV injection on the non-session, non-registered path.
+    // When X-Hermes-Variant is set and valid (not "none"), import the pre-exported
+    // variant KV and use it as the prefix instead of a fresh context.
+    if let Some(variant) = variant_header {
+        if crate::variant::is_valid_variant(variant) && variant != "none" {
+            return prepare_variant_execution(&model, request, variant, t_start).await;
         }
     }
 
@@ -1111,6 +1129,98 @@ async fn prepare_execution(request: &ChatCompletionRequest) -> Result<PreparedEx
             flush_ms: 0.0,
             total_ms: t_start.elapsed().as_secs_f64() * 1000.0,
             mode: "direct",
+            ..Default::default()
+        },
+        session_incoming_tokens: None,
+    })
+}
+
+/// Phase-1 Idea A: variant-KV injection path.
+///
+/// Imports pre-exported KV pages for the named variant and reconstructs a
+/// Context via `from_imported_state`, then appends the chat tokens on top.
+/// This is the non-session, non-registered-prefix path only (Phase-1 scope).
+async fn prepare_variant_execution(
+    model: &inferlet::Model,
+    request: &ChatCompletionRequest,
+    variant: &str,
+    t_start: std::time::Instant,
+) -> Result<PreparedExecution, String> {
+    use inferlet::forward::Forward;
+
+    let meta = crate::variant::load_metadata(variant).ok_or_else(|| {
+        format!(
+            "variant '{}' has no stored metadata — run scripts/export-variant-kv.py first",
+            variant
+        )
+    })?;
+
+    let queue = model.create_queue();
+    let handle = crate::variant::handle_name_for(variant);
+    let kv_pages = queue.import_kv_pages(&handle);
+
+    if kv_pages.is_empty() {
+        return Err(format!(
+            "variant '{}' KV pages not found on queue — re-run export-variant-kv.py",
+            variant
+        ));
+    }
+
+    let mut ctx = inferlet::Context::from_imported_state(
+        model,
+        kv_pages,
+        meta.token_ids.clone(),
+        meta.kv_page_last_len,
+    );
+
+    let t0 = std::time::Instant::now();
+    let chat_tokens = crate::prompt_render::format_chat_tokens(
+        model,
+        &request.messages,
+        &request.tools,
+        &request.chat_template_kwargs,
+        true,
+    )
+    .await
+    .unwrap_or_default();
+    let format_chat_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let variant_token_count = meta.token_ids.len() as u32;
+    let chat_token_count = chat_tokens.len() as u32;
+    let prompt_tokens = variant_token_count + chat_token_count;
+
+    let t1 = std::time::Instant::now();
+    ctx.fill_tokens(chat_tokens);
+    let fill_tokens_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+    Ok(PreparedExecution {
+        model: model.clone(),
+        ctx,
+        prompt_tokens,
+        pie_cache: Some(PieCacheTelemetry {
+            mode: format!("variant:{}", variant),
+            cache_epoch: crate::prompt_cache::cache_epoch(),
+            fallback_used: false,
+            reused_prefix: None,
+            stale_prefix: false,
+            stale_epoch: false,
+            prefill_tokens_skipped: variant_token_count,
+            prompt_tokens_total: prompt_tokens,
+            prompt_tokens_computed: chat_token_count,
+            debug: None,
+            session_id: None,
+            session_turn: None,
+            prefix_match_len: None,
+            total_incoming_tokens: None,
+            tail_tokens_filled: None,
+            fallback_reason: None,
+        }),
+        profile: PrepareProfile {
+            format_chat_ms,
+            fill_tokens_ms,
+            flush_ms: 0.0,
+            total_ms: t_start.elapsed().as_secs_f64() * 1000.0,
+            mode: "variant",
             ..Default::default()
         },
         session_incoming_tokens: None,

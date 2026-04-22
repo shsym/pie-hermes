@@ -92,6 +92,15 @@ async fn main(mut req: Request<IncomingBody>, res: Responder) -> Finished {
                 .and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")))
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default();
+            // X-Hermes-Variant: "codex" | "google" — absent/empty/"none" → None.
+            // Parsed case-insensitively; only valid non-"none" values survive.
+            let variant_header = {
+                let headers_iter = req
+                    .headers()
+                    .iter()
+                    .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.as_str(), vs)));
+                variant::parse_variant_header(headers_iter)
+            };
             let mut body_bytes = Vec::new();
             if read_body(req.body_mut(), &mut body_bytes).await.is_err() {
                 return error_response(res, 400, "Failed to read request body").await;
@@ -103,6 +112,7 @@ async fn main(mut req: Request<IncomingBody>, res: Responder) -> Finished {
                 n_candidates,
                 session_id_header,
                 auth_bearer,
+                variant_header,
             )
             .await
         }
