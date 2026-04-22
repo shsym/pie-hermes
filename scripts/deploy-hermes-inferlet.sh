@@ -28,9 +28,10 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PIECLAW_DIR="${PIECLAW_DIR:-$REPO_ROOT/../../../pieclaw}"
-# Normalize: if the path doesn't exist, try the absolute workspace location.
 if [ ! -d "$PIECLAW_DIR" ]; then
-    PIECLAW_DIR="/Users/seung-seoblee/Workspace/pieclaw"
+    echo "error: PIECLAW_DIR='$PIECLAW_DIR' is not a directory." >&2
+    echo "       Set PIECLAW_DIR=/path/to/pieclaw checkout (contains scripts/setup-engine.sh)." >&2
+    exit 2
 fi
 
 MODEL="Qwen/Qwen2.5-72B-Instruct-AWQ"

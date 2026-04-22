@@ -70,7 +70,7 @@ docker run --rm -i \
     -v "$REPO_ROOT/captures:/opt/pie-hermes/captures" \
     -v "$TMP_CONFIG:/opt/hermes-config/config.yaml:ro" \
     -v "$REPO_ROOT/hermes-agent/run_agent.py:/opt/hermes/run_agent.py:ro" \
-    -v "$REPO_ROOT/hermes-agent/agent/prompt_optimizer.py:/opt/hermes/agent/prompt_optimizer.py:ro" \
+    -v "$REPO_ROOT/hermes-agent/agent:/opt/hermes/agent:ro" \
     --add-host=host.docker.internal:host-gateway \
     --entrypoint /bin/bash \
     "$HERMES_IMAGE" -c '

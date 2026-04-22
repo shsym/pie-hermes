@@ -42,5 +42,7 @@ test-logs/
 # --- Capture runs are reproducible artifacts — don't commit them. ---
 captures/runs/*
 
-# --- Plans / working docs — local only (CLAUDE.md: "don't commit docs") ---
-docs/
+# --- Plans / working docs — local only (CLAUDE.md: "don't commit docs"). ---
+# Scoped to repo-root /docs/ so nested `docs/` dirs inside submodules or
+# vendored crates are NOT silently hidden.
+/docs/

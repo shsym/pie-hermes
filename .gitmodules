@@ -7,5 +7,5 @@
 	ignore = untracked
 [submodule "pie-vllm"]
 	path = pie-vllm
-	url = git@github.com:shsym/pie-vllm.git
+	url = https://github.com/shsym/pie-vllm.git
 	ignore = untracked
