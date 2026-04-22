@@ -39,3 +39,38 @@ def test_gateway_fixture_contains_plausible_metadata():
         assert keyword in GATEWAY_EPHEMERAL_FIXTURE, (
             f"Fixture missing plausible gateway metadata keyword: {keyword}"
         )
+
+
+def test_probe_ephemeral_handle_recall_present():
+    assert "probe-ephemeral-handle-recall" in SCENARIOS
+    _, _, _, tags = SCENARIOS["probe-ephemeral-handle-recall"]
+    assert "gateway" in tags    # picks up GATEWAY_EPHEMERAL_FIXTURE injection
+    assert "ephemeral" in tags
+    assert "probe" in tags
+
+
+def test_probe_expectations_dict_present():
+    from bench.driver import PROBE_EXPECTATIONS
+    assert "probe-ephemeral-handle-recall" in PROBE_EXPECTATIONS
+    spec = PROBE_EXPECTATIONS["probe-ephemeral-handle-recall"]
+    assert spec["must_contain_all"] == ["@alice_demo", "1.42"]
+
+
+def test_every_probe_scenario_has_expectations():
+    """Every scenario tagged 'probe' must have a PROBE_EXPECTATIONS entry."""
+    from bench.driver import PROBE_EXPECTATIONS
+    probe_scenarios = {slug for slug, (_, _, _, tags) in SCENARIOS.items() if "probe" in tags}
+    missing = probe_scenarios - PROBE_EXPECTATIONS.keys()
+    assert not missing, f"Probe scenarios missing PROBE_EXPECTATIONS: {missing}"
+
+
+def test_probe_must_contain_strings_actually_appear_in_fixture_for_handle_recall():
+    """Smoke check: the probe asks the model to surface tokens that should be
+    present in the GATEWAY_EPHEMERAL_FIXTURE injected for gateway-tagged
+    scenarios. If the fixture changes and these tokens disappear, the probe
+    becomes meaningless — flag that here, before pod time."""
+    from bench.driver import GATEWAY_EPHEMERAL_FIXTURE, PROBE_EXPECTATIONS
+    for substr in PROBE_EXPECTATIONS["probe-ephemeral-handle-recall"]["must_contain_all"]:
+        assert substr in GATEWAY_EPHEMERAL_FIXTURE, (
+            f"Probe expects model to mention {substr!r}, but it's not in the fixture"
+        )

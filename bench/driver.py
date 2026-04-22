@@ -159,6 +159,33 @@ SCENARIOS: dict[str, tuple[str, int, str, list[str]]] = {
         "Gateway-shaped, multi-turn: ephemeral metadata compounds across turns",
         ["gateway", "ephemeral", "multi-turn"],
     ),
+
+    # ---- Probes: dedicated scenarios that fail without semantic re-injection ----
+    "probe-ephemeral-handle-recall": (
+        "Address me by my Telegram handle and reference the most recent reply-to "
+        "excerpt VERBATIM (the rollout version mentioned). Keep your reply under 30 words.",
+        3,
+        "Probe: response must mention @alice_demo AND the '1.42' rollout token "
+        "from the ephemeral fixture. Phase-1 head FAILS this (ephemeral parsed "
+        "then discarded); Phase-2.0 PASSES (re-prefilled after cached prefix).",
+        ["gateway", "ephemeral", "probe"],
+    ),
+}
+
+
+# Probe expectations: per-scenario assertions checked by capture-run analyzers.
+# Keys are scenario slugs; values declare what the assistant's final reply must
+# (or must not) contain. The analyzer that consumes this lives outside the
+# driver — driver itself does not enforce; it only declares.
+#
+# Schema (extensible; add fields as new probe shapes appear):
+#   "must_contain_all":  list[str]  — final assistant reply must contain ALL of these substrings (case-sensitive)
+#   "must_not_contain":  list[str]  — final assistant reply must contain NONE of these substrings
+PROBE_EXPECTATIONS: dict[str, dict[str, list[str]]] = {
+    "probe-ephemeral-handle-recall": {
+        "must_contain_all": ["@alice_demo", "1.42"],
+        "must_not_contain": [],
+    },
 }
 
 
