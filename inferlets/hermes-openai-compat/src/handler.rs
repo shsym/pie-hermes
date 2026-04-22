@@ -167,9 +167,22 @@ pub async fn handle_chat_completions(
     session_id_header: Option<String>,
     auth_bearer: String,
     variant_header: Option<String>,
+    ephemeral_header: Option<String>,
 ) -> Finished {
     let t_entry = std::time::Instant::now();
     let body_len = body_bytes.len();
+
+    // Phase-1G: observe the X-Hermes-Ephemeral plumbing is alive. Log only the
+    // raw base64 length, NEVER the decoded bytes — ephemeral payloads carry
+    // user-scoped metadata (chat_id, handle, reactions) which must not leak
+    // through inferlet telemetry. Post-generation formatting logic lives in a
+    // later phase.
+    if let Some(b64) = &ephemeral_header {
+        eprintln!(
+            "hermes-ephemeral: header received ({} bytes base64); no post-processing in Phase 1",
+            b64.len()
+        );
+    }
 
     // Parse request
     let mut request: ChatCompletionRequest = match serde_json::from_slice(&body_bytes) {

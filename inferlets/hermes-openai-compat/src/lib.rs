@@ -101,6 +101,17 @@ async fn main(mut req: Request<IncomingBody>, res: Responder) -> Finished {
                     .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.as_str(), vs)));
                 variant::parse_variant_header(headers_iter)
             };
+            // X-Hermes-Ephemeral: base64(utf-8) — absent/empty/malformed → None.
+            // Phase-1: validated and logged (length only — NEVER decoded into
+            // logs) so the Phase-1G plumbing is observable on the live pod.
+            // Post-generation formatting is deferred to a later phase.
+            let ephemeral_header = {
+                let headers_iter = req
+                    .headers()
+                    .iter()
+                    .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.as_str(), vs)));
+                variant::parse_ephemeral_header(headers_iter)
+            };
             let mut body_bytes = Vec::new();
             if read_body(req.body_mut(), &mut body_bytes).await.is_err() {
                 return error_response(res, 400, "Failed to read request body").await;
@@ -113,6 +124,7 @@ async fn main(mut req: Request<IncomingBody>, res: Responder) -> Finished {
                 session_id_header,
                 auth_bearer,
                 variant_header,
+                ephemeral_header,
             )
             .await
         }

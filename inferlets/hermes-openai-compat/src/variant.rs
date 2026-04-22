@@ -73,6 +73,36 @@ pub fn parse_variant_header<'a>(
     None
 }
 
+/// Parses `X-Hermes-Ephemeral` from a header iterator. Returns `None` when the
+/// header is absent, empty, or not well-formed base64. Case-insensitive on the
+/// header name.
+///
+/// Phase-1 scope: we only validate that the payload is decodable base64 — we
+/// do NOT decode or inspect the content here. Callers receive the raw base64
+/// string so that decoded user data never crosses the validation boundary via
+/// return value (and, in particular, never gets accidentally logged). Actual
+/// platform-specific post-processing is deferred to a later phase.
+pub fn parse_ephemeral_header<'a>(
+    headers_iter: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Option<String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    for (name, value) in headers_iter {
+        if name.eq_ignore_ascii_case("x-hermes-ephemeral") {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            // Decode attempt is just a well-formedness check; the decoded
+            // bytes are discarded so they cannot leak into logs.
+            if STANDARD.decode(trimmed).is_ok() {
+                return Some(trimmed.to_string());
+            }
+            return None;
+        }
+    }
+    None
+}
+
 #[derive(Deserialize)]
 pub struct ExportRequest {
     pub variant_name: String,
@@ -280,6 +310,57 @@ mod tests {
         assert_eq!(
             parse_variant_header(headers.iter().map(|(k, v)| (*k, *v))),
             Some("codex".to_string()),
+        );
+    }
+}
+
+#[cfg(test)]
+mod ephemeral_header_tests {
+    use super::*;
+
+    fn iter<'a>(items: &'a [(&'a str, &'a str)]) -> impl Iterator<Item = (&'a str, &'a str)> {
+        items.iter().copied()
+    }
+
+    #[test]
+    fn absent_returns_none() {
+        assert_eq!(parse_ephemeral_header(iter(&[])), None);
+        assert_eq!(
+            parse_ephemeral_header(iter(&[("content-type", "application/json")])),
+            None,
+        );
+    }
+
+    #[test]
+    fn empty_value_returns_none() {
+        assert_eq!(
+            parse_ephemeral_header(iter(&[("X-Hermes-Ephemeral", "")])),
+            None,
+        );
+        assert_eq!(
+            parse_ephemeral_header(iter(&[("X-Hermes-Ephemeral", "   ")])),
+            None,
+        );
+    }
+
+    #[test]
+    fn case_insensitive_name() {
+        let b64 = "Y2hhdF9pZD0xMjM="; // "chat_id=123"
+        assert_eq!(
+            parse_ephemeral_header(iter(&[("x-hermes-ephemeral", b64)])),
+            Some(b64.to_string()),
+        );
+        assert_eq!(
+            parse_ephemeral_header(iter(&[("X-HERMES-EPHEMERAL", b64)])),
+            Some(b64.to_string()),
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_base64() {
+        assert_eq!(
+            parse_ephemeral_header(iter(&[("X-Hermes-Ephemeral", "!!!!")])),
+            None,
         );
     }
 }
