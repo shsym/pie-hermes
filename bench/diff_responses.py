@@ -14,10 +14,10 @@ Scenarios present in only one run are reported separately so the operator
 can see coverage asymmetries.
 
 Caveat: inference is non-deterministic unless the capture was taken at
-temp=0. `--temp-tolerance` controls what counts as a "material" text
-diff — at default temperatures, expect the report to flag many text
-changes as informational-only. Structural axes (exit_code, tool_call
-names, n_calls) are the reliable signals at any temperature.
+temp=0. At default temperatures, expect the report to flag many text
+changes as informational-only; use `--struct-only` to exit non-zero only
+on structural diffs. Structural axes (exit_code, tool_call names,
+n_calls) are the reliable signals at any temperature.
 
 Usage:
     python -m bench.diff_responses BASELINE_DIR CANDIDATE_DIR

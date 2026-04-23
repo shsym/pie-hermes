@@ -33,18 +33,34 @@ pub const MAX_BODY_TEXT_BYTES: usize = 1024 * 1024;
 /// `section_id` may legitimately contain '-' (e.g. "agents.md#coding-style"),
 /// allowing '-' in `body_hash` makes the handle non-injective — different
 /// (section_id, body_hash) pairs can collide on the same handle string.
-/// Restricting `body_hash` to alphanumerics preserves injectivity and still
-/// admits every realistic hash encoding the agent uses (hex, base32, unpadded
-/// base64 without `+`/`/`/`=`, etc.).
+///
+/// We therefore forbid '-' in body_hash and permit the character set that
+/// covers the hash encodings agents actually send:
+///
+///   - hex                       — `[0-9a-fA-F]` (alphanumeric subset)
+///   - base32 padded/unpadded    — `[A-Z2-7=]`
+///   - standard base64           — `[A-Za-z0-9+/=]` (we reject `+` and `/`
+///                                  because they commonly need URL/path
+///                                  escaping downstream; standard base64
+///                                  callers should switch to URL-safe)
+///   - URL-safe base64           — `[A-Za-z0-9_=]` (no `-`; callers that
+///                                  need URL-safe with `-` must strip it
+///                                  or switch to hex)
+///
+/// So the accepted set is `[A-Za-z0-9_=]`: alphanumerics plus `_` (URL-safe
+/// base64 alphabet) and `=` (padding). Injectivity still holds because '-'
+/// is the handle separator and never appears in body_hash.
 fn is_valid_body_hash(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric())
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'=')
 }
 
 pub fn handle_name_for(section_id: &str, body_hash: &str) -> String {
     // section_id may contain '#' or '/'; that is fine — it is opaque to the
     // engine's resource registry, and the body_hash suffix disambiguates.
-    // Injectivity is preserved by the body_hash alphanumeric-only invariant
-    // enforced at the API layer (see is_valid_body_hash).
+    // Injectivity is preserved by body_hash forbidding '-' (the separator)
+    // — see is_valid_body_hash for the full accepted character set.
     format!("hermes-section-{}-{}", section_id, body_hash)
 }
 
@@ -119,7 +135,7 @@ pub async fn handle_register(body_bytes: Vec<u8>, responder: Responder) -> Finis
         return crate::error_response(
             responder,
             400,
-            "body_hash must be non-empty ASCII alphanumeric (handle injectivity)",
+            "body_hash must be non-empty and contain only [A-Za-z0-9_=] (handle injectivity)",
         )
         .await;
     }
@@ -269,19 +285,27 @@ mod tests {
     }
 
     #[test]
-    fn body_hash_validator_accepts_hex_and_rejects_ambiguous() {
+    fn body_hash_validator_accepts_common_encodings_and_rejects_ambiguous() {
+        // Hex (alphanumeric subset) — always accepted.
         assert!(is_valid_body_hash("deadbeef12345678"));
         assert!(is_valid_body_hash("ABCdef0123"));
-        // Empty → rejected (also caught by the is_empty check, but is_valid
-        // is the authoritative gate).
+        // Padded base32/base64 — `=` is allowed (no injectivity risk).
+        assert!(is_valid_body_hash("abc=="));
+        assert!(is_valid_body_hash("MZXW6YTBOI======"));
+        // URL-safe base64 minus `-` — `_` is allowed.
+        assert!(is_valid_body_hash("abc_def_ghi"));
+        assert!(is_valid_body_hash("Zm9vX2Jhcg=="));
+        // Empty → rejected (also caught by is_empty check, but is_valid is
+        // the authoritative gate).
         assert!(!is_valid_body_hash(""));
         // Dashes would break handle injectivity — see handle_name_for doc.
         assert!(!is_valid_body_hash("dead-beef"));
-        // Dots / slashes / hash — same rationale.
+        // Standard base64 chars `+` and `/` rejected (downstream escaping).
+        assert!(!is_valid_body_hash("ab+cd"));
+        assert!(!is_valid_body_hash("ab/cd"));
+        // Dots / hash / whitespace / non-ASCII — rejected.
         assert!(!is_valid_body_hash("dead.beef"));
-        assert!(!is_valid_body_hash("dead/beef"));
         assert!(!is_valid_body_hash("dead#beef"));
-        // Whitespace and non-ASCII → rejected.
         assert!(!is_valid_body_hash("dead beef"));
         assert!(!is_valid_body_hash("café"));
     }
