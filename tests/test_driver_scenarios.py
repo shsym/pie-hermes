@@ -131,6 +131,33 @@ def test_one_call_seed_actually_contains_hc_prefix():
     assert "hc_" in content
 
 
+def test_one_call_seed_summary_does_not_leak_the_rule():
+    """Capture-run #1 lesson: when the section's first non-blank body line
+    contains the actionable rule, agent.context_summary._summary_for puts
+    the rule INTO THE INDEX SUMMARY, and the model can answer from the
+    summary without ever calling read_context. The probe then incorrectly
+    fails its `must_call_tool: read_context` assertion even though the
+    Phase-2.1 mechanism is working — false negative.
+
+    This test locks in the fix: the first non-blank line of the
+    'Coding style' section MUST be uninformative meta-prose that does NOT
+    contain the answer token 'hc_'. The actual rule lives later in the body
+    so the body load (via read_context) is required to find it."""
+    from bench.driver import SCENARIO_CONTEXT_SEEDS
+    from agent.context_summary import summarize_context_file
+    content = SCENARIO_CONTEXT_SEEDS["probe-read-context-one-call"]["AGENTS.md"]
+    sections = {s.id: s for s in summarize_context_file("AGENTS.md", content)}
+    assert "agents.md#coding-style" in sections
+    coding_style = sections["agents.md#coding-style"]
+    assert "hc_" not in coding_style.summary, (
+        f"Summary leaks the answer: {coding_style.summary!r}. "
+        f"First body line must be uninformative meta-prose so the model "
+        f"is forced to call read_context to find 'hc_'."
+    )
+    # Body must still contain the answer (otherwise read_context can't help either).
+    assert "hc_" in coding_style.body
+
+
 def test_no_call_seed_does_not_contain_4_so_baseline_can_answer():
     """The no-call seed must NOT contain the answer to '2+2' — otherwise the
     model could plausibly cheat by loading the section. The whole point of

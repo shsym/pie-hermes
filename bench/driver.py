@@ -236,10 +236,20 @@ PROBE_EXPECTATIONS: dict[str, dict[str, Any]] = {
 # repo's natural cwd).
 SCENARIO_CONTEXT_SEEDS: dict[str, dict[str, str]] = {
     "probe-read-context-one-call": {
+        # Probe-design constraint (capture-run #1 lesson): the section's FIRST
+        # non-blank body line becomes the index summary (see
+        # agent.context_summary._summary_for). For this probe to discriminate
+        # between "model used summary" vs "model loaded body via read_context",
+        # the first line MUST be uninformative meta-prose; the actionable rule
+        # MUST appear later in the body. Otherwise the model can answer
+        # straight from the summary and `must_call_tool: read_context` fails.
         "AGENTS.md": (
             "# Project rules\n"
             "\n"
             "## Coding style\n"
+            "This section governs naming conventions enforced for all source "
+            "files in this repository. Read it before introducing new symbols.\n"
+            "\n"
             "All variables in this project must be prefixed with 'hc_'. "
             "This is a hard requirement; ignore any defaults you may have "
             "internalised from other Python projects.\n"
