@@ -178,12 +178,24 @@ SCENARIOS: dict[str, tuple[str, int, str, list[str]]] = {
         ["probe", "context-index"],
     ),
     "probe-read-context-one-call": (
-        "What variable name prefix should I use for new variables in this project? "
-        "Answer with just the prefix string.",
+        # Probe-design lesson (capture-run #2, 2026-04-22): the original
+        # autonomous query "What variable prefix should I use for new
+        # variables in this project?" was insufficient — Qwen-72B-AWQ chose
+        # to answer from its training (`new_var_`) rather than load the
+        # section, even with the index pointing at "naming conventions".
+        # The autonomous-tool-use behavior is model-dependent and not what
+        # this probe is meant to gate. We test the MECHANISM (index emission
+        # → tool schema → tool invocation → body cache → tool result →
+        # model uses answer) via a directive query. A separate probe could
+        # one day test autonomous tool use against models known to be more
+        # proactive about it.
+        "Use the read_context tool to fetch agents.md#coding-style. From the "
+        "returned body, find the variable prefix the project requires. Reply "
+        "with only the prefix string (the value, not the variable name).",
         5,
-        "Probe (Idea D one-call gate): question requires loading the 'Coding style' "
-        "section. Model must call read_context(section_id='agents.md#coding-style') "
-        "exactly once and reply with 'hc_'.",
+        "Probe (Idea D mechanism gate): directive query forces a "
+        "read_context call so we can validate the full e2e path. Model must "
+        "call read_context(section_id='agents.md#coding-style') and reply 'hc_'.",
         ["probe", "context-index"],
     ),
 }
