@@ -408,6 +408,14 @@ pub struct PieCacheTelemetry {
     pub tail_tokens_filled: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
+    /// Approximate token count of an X-Hermes-Ephemeral payload re-prefilled
+    /// into the chat (Phase-2.0 ephemeral re-prefill — see VENDOR_SOURCE.md
+    /// divergence #6, added in Task 1C). `None` when no ephemeral header was
+    /// present. Approximation: `tokenizer.tokenize(decoded_text).len()` —
+    /// does NOT include the role markers added by the chat template, so the
+    /// actual prompt-token growth is slightly higher.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_tokens_appended: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

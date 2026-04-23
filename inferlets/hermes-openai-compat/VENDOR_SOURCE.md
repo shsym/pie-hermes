@@ -178,3 +178,107 @@ place. Any *new* logging should either (a) happen behind an `.await` or
 sync-prefix logging to `handle_chat_completions`, they will hit the same
 bug. A proper fix is an async-safe logger; task #28 should mirror this
 note upstream and coordinate on the shared solution.
+
+### 6. `decode_ephemeral_payload` + ephemeral re-prefill via `request.messages` mutation (Task 2.0)
+
+**Added:** 2026-04-22, Phase 2.0 (pie-hermes).
+
+**Reason:** Phase 1.5 left ephemeral-header content visible to the inferlet
+but invisible to the model (`let _ = &ephemeral_header;` at the top of
+`handle_chat_completions`). Phase 2.0 closes the loop by decoding the base64
+payload and inserting a synthesized system `ChatMessage` at the END of the
+existing system block in `request.messages`, BEFORE `prepare_execution` runs.
+The chat template (`format_chat_tokens` → engine-side `format_chat_rpc`)
+then renders the new system message with proper role markers.
+
+The injection happens AFTER the cached system prefix region in token-space,
+so block-cache prefix matching on the leading system tokens is preserved on
+the **direct** (non-session, non-registered, non-variant) path.
+
+**Surface:**
+- New `variant::decode_ephemeral_payload(raw_b64: &str) -> Option<String>`
+  helper (sibling of `parse_ephemeral_header`).  Returns `None` for empty
+  bytes / non-base64 / non-UTF-8 — defense-in-depth even though
+  `parse_ephemeral_header` already validates well-formedness.
+- New optional `PieCacheTelemetry.ephemeral_tokens_appended: Option<u32>`
+  field; only populated on the ephemeral path.  Approximation:
+  `tokenizer.tokenize(decoded_text).len()`; under-estimates by ~6-8 tokens
+  per request because the chat template's role markers
+  (`<|im_start|>system\n...<|im_end|>\n`) are not counted.
+- Changed handler at `src/handler.rs:175-223` (decode + inject) and
+  `:285-296` (post-prep telemetry mutation).  Bound `prepared` as `mut`.
+- Updated 12 `PieCacheTelemetry { ... }` initializer sites in
+  `src/handler.rs` to set `ephemeral_tokens_appended: None`.
+
+**Logging discipline preserved:** decoded payload is consumed by
+`request.messages` insertion only, never written to a log line.
+`parse_ephemeral_header` continues to return the raw base64 for length-only
+logging behind `.await`.
+
+**Acknowledged Phase-2.0 tradeoffs (surfaced by code review of Task 1B):**
+
+1. **Variant + ephemeral interaction.**  When `X-Hermes-Variant` and
+   `X-Hermes-Ephemeral` are BOTH set, the injected ephemeral system message
+   appears in `request.messages` before `prepare_variant_execution` runs.
+   That path imports the pre-exported variant KV and then fills
+   `format_chat_tokens(request.messages, ...)` (which now includes the
+   ephemeral block) on top.  This is COHERENT only because today's variant
+   `meta.token_ids` represents the system-prefix block only; the
+   chat-template render of `request.messages` yields the ephemeral block
+   followed by the user/assistant turns, which lands on top of the
+   variant prefix as a clean continuation.  If a future variant export
+   ever included user/assistant turns, the ephemeral injection would
+   land mid-conversation and degrade response quality.  Constraint
+   recorded for the variant-export pipeline: **variant KV must remain
+   system-prefix-only** as long as Phase-2.0 ephemeral injection is in
+   flight.
+
+2. **Session path: ephemeral content invalidates prefix-cache match on
+   turn N+1.**  The session path
+   (`prepare_session_execution`) compares the previous turn's
+   `incoming_tokens` against this turn's render.  Because the ephemeral
+   system message lives high in the system block, any variation in
+   ephemeral content between turns shifts tokens early in the stream
+   and breaks the prefix match very early — invalidating the entire
+   session KV for that turn.  The session falls through to
+   `block_cache_hit` or `full_prefill`.  This is an **accepted tradeoff
+   for Phase-2.0 shape (a)**: ephemeral content is per-message by
+   definition, and the prefix-cache hit on the *block-cache* path
+   (which keys on content hash, not session tokens) still recovers the
+   leading system region.  Phase-2.0 does NOT optimize the session +
+   ephemeral combination; that work is deferred to a later phase that
+   would need to pin a per-turn ephemeral-message position the session
+   path can normalize over.
+
+**Upstream-worthy:** conditionally — same as #4.  The "OOB metadata
+appended after cached prefix via `messages` mutation" pattern generalises
+beyond hermes; task #28 decides at merge time.  Both tradeoffs above
+should accompany any upstream patch so reviewers know what the design
+covers and what it explicitly defers.
+
+### 7. `src/context_section.rs` + `POST /v1/pie/context-section/register` route (Task 2.1, Idea D)
+
+**Added:** 2026-04-22, Phase 2.1 (pie-hermes).
+
+**Reason:** Idea D (context-files summary) replaces verbatim AGENTS.md
+(and similar) content in the system prompt with a compact index. The
+section bodies are registered server-side as named KV-prefix handles
+keyed by `(section_id, body_hash)`. At inference time, a `read_context`
+tool intercept (Task 2.2 / divergence #8) imports the prefix and surfaces
+the body to the model on demand, instead of paying the body's prompt-
+token cost on every request.
+
+**Surface:** one new source module (`src/context_section.rs`); one new
+route arm in `src/lib.rs` (`POST /v1/pie/context-section/register`); a
+side-table at `v1.section.<section_id>.latest_hash` so the read_context
+intercept can resolve a section_id to the latest body without the agent
+re-supplying the hash per-call.
+
+**Storage keys (under inferlet::store_set namespace):**
+- `v1.section.<section_id>.<body_hash>.meta` — JSON SectionMetadata.
+- `v1.section.<section_id>.latest_hash`      — most recently registered hash.
+- KV-pages handle: `hermes-section-<section_id>-<body_hash>`.
+
+**Upstream-worthy:** conditionally — same as #2 / #6. The "register a
+named prefix and intercept a tool call to import it" pattern is generic;
+the specific naming scheme is pie-hermes business. Task #28 decides.

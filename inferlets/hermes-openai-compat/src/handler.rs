@@ -172,14 +172,31 @@ pub async fn handle_chat_completions(
     let t_entry = std::time::Instant::now();
     let body_len = body_bytes.len();
 
-    // Phase-1G: the ephemeral_header is accepted here but deliberately unused
-    // on this path — post-generation formatting will arrive in a later phase.
-    // We intentionally avoid calling eprintln!() here: under pie's current
-    // wstd::http_server runtime, writing to stderr from inside the async
-    // handler caused the request to hang indefinitely (no response line was
-    // ever sent on the connection).  Bind + drop the reference so the type
-    // signature documents the plumbing without side-effects.
-    let _ = &ephemeral_header;
+    // Phase-2.0 ephemeral re-prefill: when X-Hermes-Ephemeral is present, decode
+    // the base64 payload now so we can inject it as a system message into
+    // request.messages BEFORE prepare_execution renders + tokenizes. The prefix
+    // cache hit on the leading system region is preserved because the injected
+    // content lands AFTER the cached system prefix; the chat template adds the
+    // appropriate role markers (we do NOT call ctx.fill_tokens after prepare_*,
+    // which would corrupt the trailing `<|im_start|>assistant\n` generation
+    // prompt).
+    //
+    // Logging discipline (VENDOR_SOURCE.md #5): we are in the sync prefix of an
+    // async fn — NO eprintln!/println! before the first .await. The decoded
+    // payload itself must NEVER be logged (PII boundary); a length-only log is
+    // OK only after the first .await fires.
+    let ephemeral_decoded: Option<String> = ephemeral_header
+        .as_deref()
+        .and_then(crate::variant::decode_ephemeral_payload);
+
+    // Defense-in-depth: parse_ephemeral_header (variant.rs:85+) already validates
+    // well-formedness, so a Some(header) that decodes to None should be unreachable.
+    // Catches if parse_ephemeral_header is ever relaxed without updating the decode
+    // path. No-op in release.
+    debug_assert!(
+        ephemeral_header.is_none() || ephemeral_decoded.is_some(),
+        "ephemeral header passed parse_ephemeral_header validation but decode_ephemeral_payload returned None — invariant broken"
+    );
 
     // Parse request
     let mut request: ChatCompletionRequest = match serde_json::from_slice(&body_bytes) {
@@ -189,6 +206,29 @@ pub async fn handle_chat_completions(
         }
     };
     let t_json = t_entry.elapsed();
+
+    // Inject the ephemeral payload as a system message at the END of the
+    // existing system block (right after the last system-role message, before
+    // the first non-system message). If there are no system messages at all,
+    // prepend at index 0. Routing through request.messages lets the chat
+    // template emit the proper role markers and stop-token discipline.
+    if let Some(text) = ephemeral_decoded.as_ref() {
+        let insert_at = request
+            .messages
+            .iter()
+            .position(|m| m.role != "system")
+            .unwrap_or(request.messages.len());
+        request.messages.insert(
+            insert_at,
+            ChatMessage {
+                role: "system".to_string(),
+                content: format!("[ephemeral metadata]\n{}", text),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        );
+    }
 
     // Auto-enable adaptive stop conditions when the request advertises tools.
     // The `x-pie-adaptive-stop` header is set by pie-native clients but not by
@@ -243,13 +283,26 @@ pub async fn handle_chat_completions(
     let temperature = request.temperature.unwrap_or(0.7);
     let top_p = request.top_p.unwrap_or(1.0);
 
-    let prepared = match prepare_execution(&request, variant_header.as_deref()).await {
+    let mut prepared = match prepare_execution(&request, variant_header.as_deref()).await {
         Ok(prepared) => prepared,
         Err(message) => {
             return crate::error_response(responder, 400, &message).await;
         }
     };
     let t_prepare = t_entry.elapsed();
+
+    // Phase-2.0: record an approximate token count of the injected ephemeral
+    // payload. Approximation only — `tokenize(text)` does NOT include the role
+    // markers added by the chat template, so actual prompt-token growth is
+    // slightly higher. The model is bound after prepare_execution; we tokenize
+    // here purely to populate telemetry. Logging the LENGTH is OK (we are
+    // post-await), logging the text itself is NOT.
+    if let Some(text) = ephemeral_decoded.as_ref() {
+        let approx = prepared.model.get_tokenizer().tokenize(text).len() as u32;
+        if let Some(cache) = prepared.pie_cache.as_mut() {
+            cache.ephemeral_tokens_appended = Some(approx);
+        }
+    }
 
     if request.stream {
         return handle_streaming(responder, prepared, &request, max_tokens, temperature, top_p, t_entry, t_json, t_prepare, body_len, adaptive_stop).await;
@@ -742,18 +795,13 @@ async fn handle_streaming(
             .unwrap_or_default()
             .as_nanos();
         let dn = if n_yields == 0 { first_decode_n } else { steady_decode_n };
-        // decode_n was removed from the native Pie SDK; loop decode_step instead.
-        // Correctness is preserved (same per-step sampling).
-        //
-        // PERF: per-step FFI adds measurable overhead vs the old decode_n(8) —
-        // memory note project_sdk_generate_decode_n_fix.md recorded a 9%
-        // non-streaming win when decode_n was fixed, and removing it is
-        // expected to give that back.  Acceptable during the bridge-less
-        // cutover since correctness + session-KV was the blocker; tracked for
-        // a batched native-SDK primitive in pieclaw#8.
-        let mut tokens: Vec<u32> = Vec::with_capacity(dn as usize);
-        for _ in 0..dn {
-            tokens.push(ctx.decode_step(&sampler).await);
+        // Single async yield for up to dn tokens. A per-token decode_step loop
+        // here interleaves pathologically with body.flush().await under SSE
+        // streaming load (50+ s scheduler stalls observed). See SDK
+        // context.rs L985–991 and the decode_stream docstring at L728.
+        let tokens = ctx.decode_n(&sampler, dn).await;
+        if tokens.is_empty() {
+            break 'outer;
         }
         let we = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1132,6 +1180,7 @@ async fn prepare_execution(
             total_incoming_tokens: None,
             tail_tokens_filled: None,
             fallback_reason: None,
+            ephemeral_tokens_appended: None,
         }),
         profile: PrepareProfile {
             format_chat_ms,
@@ -1224,6 +1273,7 @@ async fn prepare_variant_execution(
             total_incoming_tokens: None,
             tail_tokens_filled: None,
             fallback_reason: None,
+            ephemeral_tokens_appended: None,
         }),
         profile: PrepareProfile {
             format_chat_ms,
@@ -1341,6 +1391,7 @@ async fn prepare_session_execution(
                         total_incoming_tokens: Some(total_incoming),
                         tail_tokens_filled: Some(tail_len),
                         fallback_reason: None,
+                        ephemeral_tokens_appended: None,
                     }),
                     profile: PrepareProfile {
                         format_chat_ms,
@@ -1398,6 +1449,7 @@ async fn prepare_session_execution(
                         total_incoming_tokens: Some(total_incoming),
                         tail_tokens_filled: Some(tail_len),
                         fallback_reason: None,
+                        ephemeral_tokens_appended: None,
                     }),
                     profile: PrepareProfile {
                         format_chat_ms,
@@ -1462,6 +1514,7 @@ async fn prepare_session_execution(
                         total_incoming_tokens: Some(total_incoming),
                         tail_tokens_filled: Some(tail_len),
                         fallback_reason: Some("block_cache_hit".to_string()),
+                        ephemeral_tokens_appended: None,
                     }),
                     profile: PrepareProfile {
                         format_chat_ms,
@@ -1509,6 +1562,7 @@ async fn prepare_session_execution(
             total_incoming_tokens: Some(total_incoming),
             tail_tokens_filled: Some(total_incoming),
             fallback_reason: Some("full_prefill".to_string()),
+            ephemeral_tokens_appended: None,
         }),
         profile: PrepareProfile {
             format_chat_ms,
@@ -1563,6 +1617,7 @@ async fn prepare_structured_execution(
                     total_incoming_tokens: None,
                     tail_tokens_filled: None,
                     fallback_reason: None,
+                    ephemeral_tokens_appended: None,
                 }),
             )
             .await;
@@ -1594,6 +1649,7 @@ async fn prepare_structured_execution(
                         total_incoming_tokens: None,
                         tail_tokens_filled: None,
                         fallback_reason: None,
+                        ephemeral_tokens_appended: None,
                     }),
                 )
                 .await;
@@ -1627,6 +1683,7 @@ async fn prepare_structured_execution(
                         total_incoming_tokens: None,
                         tail_tokens_filled: None,
                         fallback_reason: None,
+                        ephemeral_tokens_appended: None,
                     }),
                 )
                 .await;
@@ -1687,6 +1744,7 @@ async fn prepare_structured_execution(
                     total_incoming_tokens: None,
                     tail_tokens_filled: None,
                     fallback_reason: None,
+                    ephemeral_tokens_appended: None,
                 }),
             )
             .await;
@@ -1718,6 +1776,7 @@ async fn prepare_structured_execution(
                             total_incoming_tokens: None,
                             tail_tokens_filled: None,
                             fallback_reason: None,
+                            ephemeral_tokens_appended: None,
                         }),
                     )
                     .await;
@@ -1793,6 +1852,7 @@ async fn prepare_structured_execution(
             total_incoming_tokens: None,
             tail_tokens_filled: None,
             fallback_reason: None,
+            ephemeral_tokens_appended: None,
         }),
         profile: PrepareProfile {
             format_chat_ms: validate_prefix_ms + format_chat_tail_ms,

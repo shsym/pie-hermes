@@ -28,6 +28,7 @@
 
 mod block_cache;
 mod constrained_sampler;
+pub mod context_section;
 mod fork_validate;
 mod handler;
 mod prompt_cache;
@@ -162,6 +163,14 @@ async fn main(mut req: Request<IncomingBody>, res: Responder) -> Finished {
                 return error_response(res, 400, "Failed to read request body").await;
             }
             variant::handle_export(body_bytes, res).await
+        }
+
+        (Method::POST, "/v1/pie/context-section/register") => {
+            let mut body_bytes = Vec::new();
+            if read_body(req.body_mut(), &mut body_bytes).await.is_err() {
+                return error_response(res, 400, "Failed to read request body").await;
+            }
+            context_section::handle_register(body_bytes, res).await
         }
 
         (Method::GET, "/v1/models") => {
