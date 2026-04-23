@@ -330,7 +330,7 @@ pub async fn handle_chat_completions(
         (result.text, meta)
     } else {
         // Single-candidate path (original behavior).
-        let sampler = build_sampler(&model, &request, temperature, top_p).await;
+        let sampler = build_sampler(&model, &request).await;
         let base_cond = max_len(max_tokens).or(ends_with_any(model.eos_tokens()));
         let stop_cond = build_stop_condition(base_cond, adaptive_stop, &model);
         let generated = ctx.generate(sampler, stop_cond).await;
@@ -441,14 +441,10 @@ fn build_stop_condition<S: StopCondition + 'static>(
 ///
 /// Non-grammar path delegates to `Model::build_sampler`, which merges
 /// client-supplied `SamplingOverrides` with the model's
-/// `generation_config.json` defaults (F2 unified sampling). The
-/// `_temperature`/`_top_p` params are unused after A7 — retained for caller
-/// signature stability; will be removed in a follow-up.
+/// `generation_config.json` defaults (F2 unified sampling).
 async fn build_sampler(
     model: &inferlet::Model,
     request: &ChatCompletionRequest,
-    _temperature: f32,
-    _top_p: f32,
 ) -> Sampler {
     let overrides = request_to_sampling_overrides(request);
 
@@ -459,10 +455,12 @@ async fn build_sampler(
 
     if let Some(tools) = &request.tools {
         if !tools.is_empty() {
-            // Grammar-constrained path. Effective rep_penalty/top_p/top_k come
-            // from the same overrides.or(defaults) merge the SDK uses on the
-            // non-grammar path — so swapping to a non-Qwen model automatically
-            // picks up the new model's generation_config.json values (F2).
+            // Grammar-constrained path. Effective rep_penalty/top_p/top_k/min_p
+            // come from the same overrides.or(defaults) merge the SDK uses on
+            // the non-grammar path — so swapping to a non-Qwen model
+            // automatically picks up the new model's generation_config.json
+            // values (F2). frequency_penalty and presence_penalty are
+            // client-only (no defaults source) per the SDK contract.
             let defaults = model.generation_defaults();
             let rep_penalty = overrides
                 .repetition_penalty
@@ -478,18 +476,32 @@ async fn build_sampler(
                 .or(defaults.top_k)
                 .filter(|k| *k > 0)
                 .unwrap_or(0);
+            let min_p_val = overrides
+                .min_p
+                .or(defaults.min_p)
+                .filter(|m| m.is_finite() && *m > 0.0 && *m < 1.0);
+            let frequency_penalty_val = overrides.frequency_penalty.unwrap_or(0.0);
+            let presence_penalty_val = overrides.presence_penalty.unwrap_or(0.0);
             let temperature_val = overrides
                 .temperature
                 .or(defaults.temperature)
                 .unwrap_or(1.0);
+            // NB: the Phase-D1 "both filters disabled" warning lives inside
+            // `build_tool_call_sampler`, emitted after its first `.await` —
+            // the `no_sync_eprintln_in_async_handlers` guard (VENDOR_SOURCE.md
+            // #5) forbids stderr writes before the first await on any async
+            // path, because wstd hangs requests when it sees them.
             match build_tool_call_sampler(
                 model,
                 tools,
                 &request.tool_choice,
                 temperature_val,
                 rep_penalty,
+                frequency_penalty_val,
+                presence_penalty_val,
                 top_p_val,
                 top_k_val,
+                min_p_val,
             )
             .await
             {
@@ -532,8 +544,11 @@ async fn build_tool_call_sampler(
     tool_choice: &crate::types::ToolChoice,
     temperature: f32,
     rep_penalty: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
     top_p: f32,
     top_k: u32,
+    min_p: Option<f32>,
 ) -> Result<Sampler, String> {
     let tokenizer = model.get_tokenizer();
 
@@ -541,6 +556,26 @@ async fn build_tool_call_sampler(
     let format = crate::tool_format::ToolCallFormat::detect(model)
         .await
         .ok_or("Could not detect tool call format for this model")?;
+
+    // Loudly flag the Phase-D1 risk surface: grammar-constrained sampling
+    // with NO long-tail truncation (top_p disabled, top_k disabled) lets the
+    // stochastic draw reach rare tokens inside the grammar's admissible set
+    // and hallucinate (evidence: bogus "1234567890" integration IDs,
+    // task #23). This warning fires when neither the client nor the model's
+    // generation_config.json supplied a cap — typical for non-Qwen models
+    // that ship empty gen_configs. It is a warning, not a hard-coded safety
+    // floor, so operators can see *why* output drifts rather than have a
+    // hidden default quietly change behavior. Placed after `.await` because
+    // the VENDOR_SOURCE.md #5 guard forbids sync stderr writes before the
+    // first await on async paths.
+    if top_p >= 1.0 && top_k == 0 {
+        eprintln!(
+            "[WARN] grammar-constrained sampling on model {:?} with top_p and top_k both disabled; \
+             long-tail hallucinations likely. Supply top_p/top_k on the request or publish \
+             generation_config.json defaults.",
+            model.get_name(),
+        );
+    }
 
     let grammar = crate::tools_grammar::tools_to_lark_grammar(tools, &format, tool_choice);
 
@@ -566,8 +601,11 @@ async fn build_tool_call_sampler(
         escape_non_printable,
         crate::constrained_sampler::SamplerOptions {
             rep_penalty,
+            frequency_penalty,
+            presence_penalty,
             top_p: Some(top_p),
             top_k: Some(top_k),
+            min_p,
             seed: None,
         },
     );
@@ -575,10 +613,12 @@ async fn build_tool_call_sampler(
     Ok(Sampler::Custom {
         temperature,
         sampler: Box::new(sampler),
-        // Penalties are applied upstream by the constrained sampler itself
-        // (see constrained_sampler.rs); pass Default here so the SDK layer
-        // doesn't re-apply them. This field became mandatory in the pie SDK
-        // at 83d1a6ac (unified sampling: gen_config + Penalties — task23).
+        // Penalties are applied inside `ConstrainedSampler::sample` (see
+        // apply_prob_penalties in constrained_sampler.rs). The SDK runtime
+        // discards `Sampler::Custom.penalties` — `decode_step` destructures
+        // with `..` and never forwards them to a Custom sampler — so this
+        // field would be ignored whatever we passed. `Penalties::default()`
+        // documents that the WASM side has already accounted for them.
         penalties: inferlet::sampler::Penalties::default(),
     })
 }
@@ -713,7 +753,7 @@ async fn handle_streaming(
     let model_name = model.get_name();
     let tokenizer = model.get_tokenizer();
 
-    let sampler = build_sampler(&model, request, temperature, top_p).await;
+    let sampler = build_sampler(&model, request).await;
     // Custom (constrained) samplers are incompatible with multi-step decode_n
     // (engine-side sampling). Fall back to single-step decode when constrained.
     let is_constrained = matches!(sampler, Sampler::Custom { .. });
