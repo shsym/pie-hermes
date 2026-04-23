@@ -1,4 +1,12 @@
-# pie-hermes distribution — pinned stack
+# pie-hermes distribution — DRAFT manifest (not yet a true lock file).
+#
+# STATUS: entries marked "TBD-at-release" (hermes_agent.pinned_sha,
+# pie.pinned_sha, inferlets.hermes_openai_compat.wasm_sha256) are filled
+# by the release pipeline (hc #33 / #34). Until then, this file serves
+# as a human-readable qualification manifest + operational reference,
+# not a reproducible install manifest. It is renamed from VERSIONS.lock
+# to VERSIONS.draft.lock to avoid over-promising lock semantics.
+#
 # Updated by task #35 qualification run on 2026-04-23.
 
 [qualification_run]

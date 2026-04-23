@@ -183,6 +183,12 @@ def parse_non_stream(record: dict) -> TurnStats:
 def analyze_scenario(path: Path, run_tag: str) -> ScenarioStats:
     scenario = path.parent.name
     stats = ScenarioStats(scenario=scenario, model="", run_tag=run_tag)
+    # Contract: one capture.jsonl = one scenario run = one model. If records
+    # disagree on kwargs.model, the file was assembled incorrectly (e.g. two
+    # runs concatenated, or a mid-run model swap). We still proceed — all turns
+    # get attributed to the first-seen model — but warn once so the operator
+    # can check capture integrity instead of trusting the number blindly.
+    mixed_model_warned = False
     try:
         with path.open() as f:
             for line in f:
@@ -190,8 +196,17 @@ def analyze_scenario(path: Path, run_tag: str) -> ScenarioStats:
                 if not line:
                     continue
                 rec = json.loads(line)
+                rec_model = rec.get("kwargs", {}).get("model") or "unknown"
                 if not stats.model:
-                    stats.model = rec.get("kwargs", {}).get("model") or "unknown"
+                    stats.model = rec_model
+                elif rec_model != stats.model and not mixed_model_warned:
+                    print(
+                        f"warning: {path} contains records from multiple models "
+                        f"({stats.model!r} and {rec_model!r}); attributing all turns "
+                        f"to first-seen model. Check capture integrity.",
+                        file=sys.stderr,
+                    )
+                    mixed_model_warned = True
                 if rec.get("stream"):
                     stats.turns.append(parse_chunks(rec.get("chunks") or []))
                 else:
