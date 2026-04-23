@@ -346,6 +346,7 @@ dependencies = [
  "inferlet-macros",
  "minijinja",
  "pico-args",
+ "rand_core",
  "serde",
  "serde_json",
  "trait-variant",
@@ -470,6 +471,12 @@ checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "rand_core"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 
 [[package]]
 name = "regex-automata"

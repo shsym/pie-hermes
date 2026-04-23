@@ -542,6 +542,11 @@ async fn build_tool_call_sampler(
     Ok(Sampler::Custom {
         temperature,
         sampler: Box::new(sampler),
+        // Penalties are applied upstream by the constrained sampler itself
+        // (see constrained_sampler.rs); pass Default here so the SDK layer
+        // doesn't re-apply them. This field became mandatory in the pie SDK
+        // at 83d1a6ac (unified sampling: gen_config + Penalties — task23).
+        penalties: inferlet::sampler::Penalties::default(),
     })
 }
 
@@ -712,6 +717,7 @@ async fn handle_streaming(
         object: "chat.completion.chunk".to_string(),
         created: 0,
         model: model_name.clone(),
+        pie_cache: None,
         choices: vec![ChunkChoice {
             index: 0,
             delta: ChunkDelta {
@@ -851,6 +857,7 @@ async fn handle_streaming(
                     object: "chat.completion.chunk".to_string(),
                     created: 0,
                     model: model_name.clone(),
+                    pie_cache: None,
                     choices: vec![ChunkChoice {
                         index: 0,
                         delta: ChunkDelta {
@@ -1028,6 +1035,7 @@ async fn handle_streaming(
             object: "chat.completion.chunk".to_string(),
             created: 0,
             model: model_name.clone(),
+            pie_cache: None,
             choices: vec![ChunkChoice {
                 index: 0,
                 delta: ChunkDelta {
@@ -1041,12 +1049,18 @@ async fn handle_streaming(
         emit!(serde_json::to_string(&tc_chunk).unwrap_or_default());
     }
 
-    // Final chunk: finish_reason
+    // Final chunk: finish_reason + pie_cache telemetry.
+    // pie_cache is attached here (not as a separate chunk) so SSE consumers
+    // that serialize chunks into a capture log observe it as a regular data:
+    // event. Mirrors the non-streaming response's top-level pie_cache field.
+    // The earlier ": [PIE-CACHE] …" comment is retained for scraper-based
+    // observers that already rely on it.
     let final_chunk = ChatCompletionChunk {
         id: chunk_id,
         object: "chat.completion.chunk".to_string(),
         created: 0,
         model: model_name,
+        pie_cache: pie_cache.clone(),
         choices: vec![ChunkChoice {
             index: 0,
             delta: ChunkDelta {

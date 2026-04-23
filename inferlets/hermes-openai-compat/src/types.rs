@@ -524,6 +524,14 @@ pub struct ChatCompletionChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+    /// Populated only on the final chunk of a stream (the one carrying
+    /// `finish_reason`). Mirrors the non-streaming response's top-level
+    /// `pie_cache` field so SSE consumers can observe the same telemetry
+    /// without re-issuing a non-streaming request. Emitted as a regular
+    /// `data:` event; the earlier `: [PIE-CACHE] …` SSE comment is kept
+    /// for backward compatibility with observers that scrape comments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pie_cache: Option<PieCacheTelemetry>,
 }
 
 /// A single choice inside a streaming chunk.
