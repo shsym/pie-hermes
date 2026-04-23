@@ -71,6 +71,9 @@ docker run --rm -i \
     -v "$TMP_CONFIG:/opt/hermes-config/config.yaml:ro" \
     -v "$REPO_ROOT/hermes-agent/run_agent.py:/opt/hermes/run_agent.py:ro" \
     -v "$REPO_ROOT/hermes-agent/agent:/opt/hermes/agent:ro" \
+    -v "$REPO_ROOT/hermes-agent/tools:/opt/hermes/tools:ro" \
+    -v "$REPO_ROOT/hermes-agent/toolsets.py:/opt/hermes/toolsets.py:ro" \
+    -v "$REPO_ROOT/hermes-agent/model_tools.py:/opt/hermes/model_tools.py:ro" \
     --add-host=host.docker.internal:host-gateway \
     --entrypoint /bin/bash \
     "$HERMES_IMAGE" -c '
