@@ -22,9 +22,29 @@ use serde::{Deserialize, Serialize};
 use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Response};
 
+/// Max accepted size of `body_text` in bytes. A context section represents a
+/// chunk of a human-authored file (AGENTS.md and friends); 1 MiB is ~2x the
+/// largest realistic section and forces obviously-abusive requests to fail
+/// fast instead of tokenizing + prefilling arbitrary input on the engine.
+pub const MAX_BODY_TEXT_BYTES: usize = 1024 * 1024;
+
+/// `body_hash` must be an unambiguous terminal segment of the exported
+/// KV-page handle (`hermes-section-<section_id>-<body_hash>`). Because
+/// `section_id` may legitimately contain '-' (e.g. "agents.md#coding-style"),
+/// allowing '-' in `body_hash` makes the handle non-injective — different
+/// (section_id, body_hash) pairs can collide on the same handle string.
+/// Restricting `body_hash` to alphanumerics preserves injectivity and still
+/// admits every realistic hash encoding the agent uses (hex, base32, unpadded
+/// base64 without `+`/`/`/`=`, etc.).
+fn is_valid_body_hash(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 pub fn handle_name_for(section_id: &str, body_hash: &str) -> String {
     // section_id may contain '#' or '/'; that is fine — it is opaque to the
     // engine's resource registry, and the body_hash suffix disambiguates.
+    // Injectivity is preserved by the body_hash alphanumeric-only invariant
+    // enforced at the API layer (see is_valid_body_hash).
     format!("hermes-section-{}-{}", section_id, body_hash)
 }
 
@@ -44,12 +64,22 @@ pub struct SectionMetadata {
     pub kv_page_last_len: usize,
 }
 
-pub fn save_metadata(meta: &SectionMetadata) {
-    if let Ok(json) = serde_json::to_string(meta) {
-        inferlet::store_set(&metadata_store_key(&meta.section_id, &meta.body_hash), &json);
-    }
-    // Side-table: latest hash for this section_id. Overwrites on re-register.
+pub fn save_metadata(meta: &SectionMetadata) -> Result<(), serde_json::Error> {
+    // Serialize first. If this fails we MUST NOT update the latest_hash
+    // side-table — otherwise it would resolve to a body_hash whose metadata
+    // record does not exist, and the Task-2.2 read_context intercept would
+    // then fail on resolve. Writes are issued metadata-first so any reader
+    // that sees the updated latest_hash is guaranteed to find the meta.
+    // Concurrent register() calls are last-writer-wins on latest_hash;
+    // the loser's metadata record still exists and remains addressable
+    // by its explicit hash.
+    let json = serde_json::to_string(meta)?;
+    inferlet::store_set(
+        &metadata_store_key(&meta.section_id, &meta.body_hash),
+        &json,
+    );
     inferlet::store_set(&latest_hash_store_key(&meta.section_id), &meta.body_hash);
+    Ok(())
 }
 
 pub fn load_metadata(section_id: &str, body_hash: &str) -> Option<SectionMetadata> {
@@ -85,8 +115,25 @@ pub async fn handle_register(body_bytes: Vec<u8>, responder: Responder) -> Finis
     if req.section_id.is_empty() {
         return crate::error_response(responder, 400, "section_id must be non-empty").await;
     }
-    if req.body_hash.is_empty() {
-        return crate::error_response(responder, 400, "body_hash must be non-empty").await;
+    if !is_valid_body_hash(&req.body_hash) {
+        return crate::error_response(
+            responder,
+            400,
+            "body_hash must be non-empty ASCII alphanumeric (handle injectivity)",
+        )
+        .await;
+    }
+    if req.body_text.len() > MAX_BODY_TEXT_BYTES {
+        return crate::error_response(
+            responder,
+            413,
+            &format!(
+                "body_text too large: {} bytes > {} limit",
+                req.body_text.len(),
+                MAX_BODY_TEXT_BYTES
+            ),
+        )
+        .await;
     }
 
     let handle = handle_name_for(&req.section_id, &req.body_hash);
@@ -95,17 +142,34 @@ pub async fn handle_register(body_bytes: Vec<u8>, responder: Responder) -> Finis
     // path can detect this section is registered (token_ids=[]). Pattern
     // mirrors the variant 'none' path in src/variant.rs:165.
     if req.body_text.is_empty() {
-        save_metadata(&SectionMetadata {
+        if let Err(e) = save_metadata(&SectionMetadata {
             section_id: req.section_id,
             body_hash: req.body_hash,
             token_ids: vec![],
             kv_page_last_len: 0,
-        });
+        }) {
+            return crate::error_response(
+                responder,
+                500,
+                &format!("metadata serialize failed: {}", e),
+            )
+            .await;
+        }
         let resp = RegisterResponse {
             handle,
             token_count: 0,
         };
-        let json = serde_json::to_string(&resp).unwrap_or_default();
+        let json = match serde_json::to_string(&resp) {
+            Ok(j) => j,
+            Err(e) => {
+                return crate::error_response(
+                    responder,
+                    500,
+                    &format!("response serialize failed: {}", e),
+                )
+                .await;
+            }
+        };
         let http = Response::builder()
             .header("Content-Type", "application/json")
             .body(json.into_body())
@@ -134,18 +198,31 @@ pub async fn handle_register(body_bytes: Vec<u8>, responder: Responder) -> Finis
         .await;
     }
 
-    save_metadata(&SectionMetadata {
+    if let Err(e) = save_metadata(&SectionMetadata {
         section_id: req.section_id,
         body_hash: req.body_hash,
         token_ids,
         kv_page_last_len,
-    });
+    }) {
+        return crate::error_response(responder, 500, &format!("metadata serialize failed: {}", e))
+            .await;
+    }
 
     let resp = RegisterResponse {
         handle,
         token_count,
     };
-    let json = serde_json::to_string(&resp).unwrap_or_default();
+    let json = match serde_json::to_string(&resp) {
+        Ok(j) => j,
+        Err(e) => {
+            return crate::error_response(
+                responder,
+                500,
+                &format!("response serialize failed: {}", e),
+            )
+            .await;
+        }
+    };
     let http = Response::builder()
         .header("Content-Type", "application/json")
         .body(json.into_body())
@@ -189,6 +266,36 @@ mod tests {
         assert_eq!(back.body_hash, meta.body_hash);
         assert_eq!(back.token_ids, meta.token_ids);
         assert_eq!(back.kv_page_last_len, meta.kv_page_last_len);
+    }
+
+    #[test]
+    fn body_hash_validator_accepts_hex_and_rejects_ambiguous() {
+        assert!(is_valid_body_hash("deadbeef12345678"));
+        assert!(is_valid_body_hash("ABCdef0123"));
+        // Empty → rejected (also caught by the is_empty check, but is_valid
+        // is the authoritative gate).
+        assert!(!is_valid_body_hash(""));
+        // Dashes would break handle injectivity — see handle_name_for doc.
+        assert!(!is_valid_body_hash("dead-beef"));
+        // Dots / slashes / hash — same rationale.
+        assert!(!is_valid_body_hash("dead.beef"));
+        assert!(!is_valid_body_hash("dead/beef"));
+        assert!(!is_valid_body_hash("dead#beef"));
+        // Whitespace and non-ASCII → rejected.
+        assert!(!is_valid_body_hash("dead beef"));
+        assert!(!is_valid_body_hash("café"));
+    }
+
+    #[test]
+    fn body_hash_hyphen_would_cause_handle_collision() {
+        // Documents the collision that the validator prevents: without the
+        // alphanumeric-only rule, these two distinct (section_id, body_hash)
+        // pairs produce the same exported-handle string.
+        let a = handle_name_for("foo-x", "bar");
+        let b = handle_name_for("foo", "x-bar");
+        assert_eq!(a, b);
+        // Sanity: at least one of these pairs is now rejected at the API.
+        assert!(!is_valid_body_hash("x-bar"));
     }
 
     #[test]

@@ -65,8 +65,19 @@ def _reassemble_streaming_message(chunks: list[dict]) -> dict:
         if delta.get("content"):
             content_parts.append(delta["content"])
         for tc in delta.get("tool_calls") or []:
-            idx = tc.get("index", 0)
-            slot = tc_by_idx.setdefault(idx, {"function": {"name": "", "arguments": ""}})
+            # `index` is required by the OpenAI streaming spec — it's how
+            # distinct tool calls within the same assistant turn are
+            # disambiguated, and how argument-string chunks are joined to
+            # the right call. Silently defaulting to 0 would coalesce every
+            # index-less chunk into slot 0 and concatenate unrelated argument
+            # strings into invalid JSON. Instead, allocate a fresh slot per
+            # index-less chunk so the anomaly surfaces as an obviously-extra
+            # call (and the analyzer's wire-shape check catches it) rather
+            # than as silently merged args.
+            raw_idx = tc.get("index")
+            if raw_idx is None:
+                raw_idx = max(tc_by_idx.keys(), default=-1) + 1
+            slot = tc_by_idx.setdefault(raw_idx, {"function": {"name": "", "arguments": ""}})
             fn = tc.get("function") or {}
             if fn.get("name"):
                 slot["function"]["name"] = fn["name"]
