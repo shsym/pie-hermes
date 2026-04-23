@@ -432,6 +432,25 @@ pub struct PieCacheTelemetry {
     /// actual prompt-token growth is slightly higher.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ephemeral_tokens_appended: Option<u32>,
+    /// Sum of body-token counts on inbound role:"tool" messages whose body
+    /// content hashed to a SectionMetadata registered via Phase 2.1's
+    /// `/v1/pie/context-section/register` route (see VENDOR_SOURCE.md #8).
+    ///
+    /// Phase 3.0 is DETECTION + TELEMETRY only. This field reports how many
+    /// tokens a future mid-stream KV splice WOULD reuse if the SDK gained
+    /// support for importing KV pages at arbitrary positions with RoPE
+    /// re-rotation. Today the registered pages still sit idle: the KV path
+    /// is unchanged and the normal prefill runs. `None` when no role:"tool"
+    /// messages were present; `Some(0)` when tool messages were present but
+    /// none matched a registered handle.
+    ///
+    /// Approximation: tokens are counted by `tokenizer.tokenize(body).len()`
+    /// on the `body` field extracted from the tool-result JSON envelope. The
+    /// chat template adds tool-role markers (`<|im_start|>tool\n...`) around
+    /// this span at render time, so the actual prompt-token footprint of the
+    /// tool message is slightly larger than the reported value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_tokens_imported: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

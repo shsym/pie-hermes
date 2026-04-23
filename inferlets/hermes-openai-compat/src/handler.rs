@@ -304,6 +304,22 @@ pub async fn handle_chat_completions(
         }
     }
 
+    // Phase-3.0: scan inbound role:"tool" messages for bodies matching a
+    // context-section handle registered at boot via Phase 2.1 (see
+    // VENDOR_SOURCE.md #8). Detection-only today — KV path is unchanged.
+    //
+    // `detect_tool_result_matches` returns `None` when there are no tool
+    // messages (field stays absent — avoids conflating "no tools present"
+    // with "tools present but no match"), `Some(0)` when tool messages
+    // exist but none match a registered handle, and `Some(n)` with the
+    // sum of body-token counts on match. The field's presence/value is
+    // what the `must_import_kv` probe gate discriminates on.
+    let tool_match_tokens =
+        crate::context_section::detect_tool_result_matches(&request.messages, &prepared.model);
+    if let Some(cache) = prepared.pie_cache.as_mut() {
+        cache.tool_result_tokens_imported = tool_match_tokens;
+    }
+
     if request.stream {
         return handle_streaming(responder, prepared, &request, max_tokens, temperature, top_p, t_entry, t_json, t_prepare, body_len, adaptive_stop).await;
     }
@@ -1227,6 +1243,7 @@ async fn prepare_execution(
             tail_tokens_filled: None,
             fallback_reason: None,
             ephemeral_tokens_appended: None,
+            tool_result_tokens_imported: None,
         }),
         profile: PrepareProfile {
             format_chat_ms,
@@ -1320,6 +1337,7 @@ async fn prepare_variant_execution(
             tail_tokens_filled: None,
             fallback_reason: None,
             ephemeral_tokens_appended: None,
+            tool_result_tokens_imported: None,
         }),
         profile: PrepareProfile {
             format_chat_ms,
@@ -1438,6 +1456,7 @@ async fn prepare_session_execution(
                         tail_tokens_filled: Some(tail_len),
                         fallback_reason: None,
                         ephemeral_tokens_appended: None,
+                        tool_result_tokens_imported: None,
                     }),
                     profile: PrepareProfile {
                         format_chat_ms,
@@ -1496,6 +1515,7 @@ async fn prepare_session_execution(
                         tail_tokens_filled: Some(tail_len),
                         fallback_reason: None,
                         ephemeral_tokens_appended: None,
+                        tool_result_tokens_imported: None,
                     }),
                     profile: PrepareProfile {
                         format_chat_ms,
@@ -1561,6 +1581,7 @@ async fn prepare_session_execution(
                         tail_tokens_filled: Some(tail_len),
                         fallback_reason: Some("block_cache_hit".to_string()),
                         ephemeral_tokens_appended: None,
+                        tool_result_tokens_imported: None,
                     }),
                     profile: PrepareProfile {
                         format_chat_ms,
@@ -1609,6 +1630,7 @@ async fn prepare_session_execution(
             tail_tokens_filled: Some(total_incoming),
             fallback_reason: Some("full_prefill".to_string()),
             ephemeral_tokens_appended: None,
+            tool_result_tokens_imported: None,
         }),
         profile: PrepareProfile {
             format_chat_ms,
@@ -1664,6 +1686,7 @@ async fn prepare_structured_execution(
                     tail_tokens_filled: None,
                     fallback_reason: None,
                     ephemeral_tokens_appended: None,
+                    tool_result_tokens_imported: None,
                 }),
             )
             .await;
@@ -1696,6 +1719,7 @@ async fn prepare_structured_execution(
                         tail_tokens_filled: None,
                         fallback_reason: None,
                         ephemeral_tokens_appended: None,
+                        tool_result_tokens_imported: None,
                     }),
                 )
                 .await;
@@ -1730,6 +1754,7 @@ async fn prepare_structured_execution(
                         tail_tokens_filled: None,
                         fallback_reason: None,
                         ephemeral_tokens_appended: None,
+                        tool_result_tokens_imported: None,
                     }),
                 )
                 .await;
@@ -1791,6 +1816,7 @@ async fn prepare_structured_execution(
                     tail_tokens_filled: None,
                     fallback_reason: None,
                     ephemeral_tokens_appended: None,
+                    tool_result_tokens_imported: None,
                 }),
             )
             .await;
@@ -1823,6 +1849,7 @@ async fn prepare_structured_execution(
                             tail_tokens_filled: None,
                             fallback_reason: None,
                             ephemeral_tokens_appended: None,
+                            tool_result_tokens_imported: None,
                         }),
                     )
                     .await;
@@ -1899,6 +1926,7 @@ async fn prepare_structured_execution(
             tail_tokens_filled: None,
             fallback_reason: None,
             ephemeral_tokens_appended: None,
+            tool_result_tokens_imported: None,
         }),
         profile: PrepareProfile {
             format_chat_ms: validate_prefix_ms + format_chat_tail_ms,
