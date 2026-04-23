@@ -1,0 +1,61 @@
+# Hermes CLI config for running against a vLLM endpoint serving
+# Qwen3.5 (capable tier) or Qwen3.5-9B (working tier).
+#
+# Tool-use reliability qualification (task #35, session task T3/T4).
+# Derived from cli-config.pie.yaml with three differences:
+#   1. model.default / context_length updated for Qwen3.5
+#   2. agent.max_turns = 20 (matches deep-breadth-audit scenario max)
+#   3. Explicit notes on --reasoning-parser qwen3 being a vLLM-side flag,
+#      not a Hermes-side setting.
+#
+# base_url stays a placeholder — ssh-tunnel the pod and point here, e.g.
+# http://127.0.0.1:18095/v1 (tunnelled) or the pod's public URL.
+
+model:
+  # Overridden per-run via env, but this is the primary candidate
+  # (session task T3). T4 swaps to -FP8 or Qwen3.5-9B.
+  default: "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
+
+  # OpenAI-wire dispatch — same path as pie config.
+  provider: "custom"
+
+  # Pod URL — run_in_container.sh seds this with HOST_BASE_URL
+  # (default http://host.docker.internal:18095/v1 when ssh-tunnelled).
+  # The placeholder must match the sed pattern in run_in_container.sh.
+  base_url: "http://REPLACE_ME:8080/v1"
+
+  # vLLM rejects empty keys; use a throwaway token.
+  api_key: "vllm-local-no-auth"
+
+  # Match vLLM --max-model-len 65536 from the pod side. Hermes requires
+  # >=64K. We don't claim Qwen3.5's native 262K since (a) it blows KV
+  # budget on A40 and (b) 64K is what we've validated fit on this hw.
+  context_length: 65536
+
+agent:
+  # CRITICAL for Qwen family: tool-use enforcement is auto-gated to
+  # gpt/codex/gemini/gemma/grok by default. Qwen3.5 is still Qwen-family
+  # and needs explicit steering (same rationale as Qwen2.5-72B — see
+  # cli-config.pie.yaml). Without this we'd measure confabulation, not
+  # real tool-call behavior.
+  tool_use_enforcement: true
+
+  # 20 turns covers deep-breadth-audit (max_turns=20 in bench/driver.py
+  # SCENARIOS). No scenario in the reliability subset exceeds 20 turns.
+  max_turns: 20
+
+  # Qwen3.5 has a built-in thinking mode. On the wire this is handled by
+  # vLLM's --reasoning-parser qwen3 (vLLM splits reasoning_content from
+  # content in the response). Hermes only reads content, so we want
+  # "none" here to avoid Hermes also trying to interpret reasoning.
+  reasoning_effort: "none"
+
+  verbose: false
+
+# Full CLI toolset so we measure realistic prompt shape + tool-call
+# behavior on the standard Hermes surface.
+platform_toolsets:
+  cli: [hermes-cli]
+
+# Compression at package defaults — keep prompt-growth dynamics honest.
+compression: {}
