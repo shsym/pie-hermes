@@ -795,18 +795,13 @@ async fn handle_streaming(
             .unwrap_or_default()
             .as_nanos();
         let dn = if n_yields == 0 { first_decode_n } else { steady_decode_n };
-        // decode_n was removed from the native Pie SDK; loop decode_step instead.
-        // Correctness is preserved (same per-step sampling).
-        //
-        // PERF: per-step FFI adds measurable overhead vs the old decode_n(8) —
-        // memory note project_sdk_generate_decode_n_fix.md recorded a 9%
-        // non-streaming win when decode_n was fixed, and removing it is
-        // expected to give that back.  Acceptable during the bridge-less
-        // cutover since correctness + session-KV was the blocker; tracked for
-        // a batched native-SDK primitive in pieclaw#8.
-        let mut tokens: Vec<u32> = Vec::with_capacity(dn as usize);
-        for _ in 0..dn {
-            tokens.push(ctx.decode_step(&sampler).await);
+        // Single async yield for up to dn tokens. A per-token decode_step loop
+        // here interleaves pathologically with body.flush().await under SSE
+        // streaming load (50+ s scheduler stalls observed). See SDK
+        // context.rs L985–991 and the decode_stream docstring at L728.
+        let tokens = ctx.decode_n(&sampler, dn).await;
+        if tokens.is_empty() {
+            break 'outer;
         }
         let we = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
