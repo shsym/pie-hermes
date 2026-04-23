@@ -282,3 +282,102 @@ re-supplying the hash per-call.
 **Upstream-worthy:** conditionally — same as #2 / #6. The "register a
 named prefix and intercept a tool call to import it" pattern is generic;
 the specific naming scheme is pie-hermes business. Task #28 decides.
+
+### 8. Tool-result body → registered-handle detection + telemetry (Task 3.0)
+
+**Added:** 2026-04-23, Phase 3.0 (pie-hermes).
+
+**Scope-limitation upfront:** this divergence ships DETECTION + TELEMETRY
+ONLY. The KV path is unchanged. The registered pages from divergence #7
+still sit idle; the normal prefill runs. See "Why not actual prefill-skip
+yet" below.
+
+**Reason:** Phase 2.1 registered context-section KV pages as named
+KV-prefix handles but did not consume them. Phase 3.0 closes the
+observability loop: the inferlet hashes every inbound `role:"tool"`
+message body, looks it up against the handle table, and reports the
+matched-token count so a capture-run can verify that (a) hermes-agent's
+boot-time registrar reached the inferlet, (b) the body-hash wire format
+matches across Python and Rust, and (c) the `read_context` tool path
+delivers bodies whose hashes line up with what was registered. Those
+invariants are preconditions for any future prefill-skip work.
+
+**Surface:**
+- `src/context_section.rs`: new `detect_tool_result_matches(messages,
+  model) -> Option<u32>` helper + `body_hash_16(body) -> String`.
+  `body_hash_16` produces the same 16-char SHA-256 hex prefix that
+  hermes-agent's `ContextSection.body_hash` emits (cross-checked in unit
+  tests — a drift here would silently break lookups on byte-identical
+  bodies).
+- `src/types.rs`: new `PieCacheTelemetry.tool_result_tokens_imported:
+  Option<u32>` field, `skip_serializing_if = Option::is_none`. Wire
+  shape parity with the existing `ephemeral_tokens_appended`
+  approximation.
+- `src/handler.rs:~309`: scan-and-populate, right after the Phase-2.0
+  ephemeral-telemetry block. 12 existing `PieCacheTelemetry { ... }`
+  initializer sites updated to carry `tool_result_tokens_imported: None`.
+- No changes to the register route, no storage-format changes.
+
+**Telemetry semantics:**
+- `None`: no `role:"tool"` messages in the request.
+- `Some(0)`: tool messages present; none matched a registered handle
+  (either malformed envelope, unknown section_id, or hash drift).
+- `Some(n)`: sum of `tokenizer.tokenize(body).len()` for every matched
+  tool message. Reports the body-span footprint only; the tool-role
+  markers added by the chat template (`<|im_start|>tool\n...<|im_end|>`)
+  are NOT counted, so the actual prompt-token footprint of the tool
+  message is ~4–6 tokens larger than the reported value. Using the body
+  span rather than `SectionMetadata.token_ids.len()` (which is the
+  `fill_system`-wrapped register-time count) gives a more honest
+  "would-be-saved" number and keeps the units consistent with
+  `ephemeral_tokens_appended`.
+
+**Content-hash only, no server-side dispatch:** the detector does NOT
+inspect the preceding assistant message's `tool_calls` or `section_id`
+arguments. Match is purely on the `(section_id, body_hash)` pair parsed
+out of the tool-result JSON envelope. Server-side tool dispatch is
+explicitly deferred (task #32 trigger #3).
+
+**Why not actual prefill-skip yet:** the KV pages registered under
+divergence #7 are exported from a context built by `ctx.fill_system(body)`
+— so they are (a) wrapped in `<|im_start|>system\n…<|im_end|>\n` role
+markers at the token level and (b) RoPE-rotated for absolute positions
+`0..N`. A `role:"tool"` span in a real chat render has DIFFERENT role
+markers (`<|im_start|>tool\n…`) and lives at absolute position `M..M+N`
+where `M` is the length of the system+user+assistant(tool_call) prefix.
+Neither mismatch is fixable with the current SDK surface:
+
+- `Context::from_imported_state*` is prefix-only — it builds a new
+  Context from imported KV and lets you `fill_tokens` on top; there is
+  no API for splicing imported KV into the middle of an existing token
+  stream.
+- Imported K tensors are not re-rotated (`from_imported_state_with_
+  positions` comment: "flashinfer does not re-apply RoPE …the rewritten
+  value is only ever read by `prepare_forward_pass` to derive
+  `last_pos_id + 1` for the new tokens"). So even if mid-stream splice
+  were possible, the K values baked at positions `0..N` would produce
+  incorrect attention at positions `M..M+N`.
+
+Closing this gap requires one of:
+1. New SDK surface for "splice KV at arbitrary positions with K
+   re-rotation" (coordinate via task #28 — affects pieclaw too).
+2. Modify the register path to export raw body tokens (drop the
+   `fill_system` wrap) AND arrange the chat render so bodies land at
+   position 0 — either via a protocol change (agent-side, explicitly a
+   Phase-3.0 non-goal) or via a fork of the chat template that pins
+   tool-result bodies to the prefix.
+3. Accept non-zero behavioral diff and import with positional drift —
+   rejected by the Phase-3.0 zero-diff verification gate.
+
+Phase 3.0 takes path (0): observe the preconditions first; decide
+between (1)–(3) at the Phase 3.1 boundary informed by capture-run data.
+Expected future savings unchanged: ~20–80 ms per `read_context` call
+(200–800-tok bodies on A100), <3% end-to-end per session with ~5 calls.
+
+**Back-compat:** zero by construction — the KV path is unchanged.
+Telemetry field is `Option<u32>` with `skip_serializing_if`, so responses
+to clients that don't know the field are byte-identical to Phase 2.1.
+
+**Upstream-worthy:** conditionally, after the Phase 3.1 prefill-skip
+lands. The detector alone is not useful to pieclaw until the mechanism it
+measures exists. Task #28 revisits at Phase 3.1.
