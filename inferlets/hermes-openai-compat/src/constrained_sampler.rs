@@ -6,11 +6,12 @@
 //! Ported from pie/sdk/examples/constrained-decoding/src/sampler.rs.
 
 use fancy_regex::Regex;
-use inferlet::sampler::Sample;
+use inferlet::sampler::{Sample, apply_top_k, apply_top_p, weighted_sample};
 use inferlet::{Result, bail};
 use llguidance::api::TopLevelGrammar;
 use llguidance::toktrie::{TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv};
 use llguidance::{Matcher, ParserFactory};
+use rand_core::RngCore;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -24,24 +25,92 @@ pub struct ConstrainedSampler {
 struct Inner {
     constraint: Matcher,
     eos_token_id: u32,
-    /// xorshift64* PRNG state. Seeded from WASI random (or host time outside
-    /// WASM) at construction.
-    rng_state: u64,
+    /// xorshift64* PRNG wrapped in a `RngCore` adapter so it can feed the
+    /// SDK's `weighted_sample`. Seeded from WASI random (or host time
+    /// outside WASM) at construction.
+    rng: XorshiftRng,
     /// Multiplicative divisor applied to the probability of any token
-    /// present in `emitted_history` before the weighted draw. 1.0 disables
-    /// the penalty (identity). Values >1 make repeats less likely.
+    /// present in `history` before the weighted draw. 1.0 disables the
+    /// penalty (identity). Values >1 make repeats less likely.
     ///
     /// Matches vLLM's `repetition_penalty` semantics; Qwen2.5's
     /// `generation_config.json` ships `repetition_penalty=1.05`.
     rep_penalty: f32,
+    /// OpenAI-style frequency_penalty. Applied in prob-space as
+    /// `p *= exp(-frequency_penalty * count)` where `count` is the number
+    /// of times the token appears in `history`. 0.0 disables. See the
+    /// "why prob-space" note on `rep_penalty` — identical caveat.
+    frequency_penalty: f32,
+    /// OpenAI-style presence_penalty. Applied in prob-space as
+    /// `p *= exp(-presence_penalty)` when the token has `count > 0` in
+    /// `history` (count-independent). 0.0 disables.
+    presence_penalty: f32,
     /// Nucleus (top-p) cutoff, in (0.0, 1.0]. Values >= 1.0 disable.
     top_p: f32,
     /// Top-k cap. 0 disables.
     top_k: u32,
-    /// Circular buffer of recently emitted token ids. Bounded to
-    /// `history_max` to keep the per-step `.contains()` cheap.
-    emitted_history: VecDeque<u32>,
-    history_max: usize,
+    /// Min-p truncation threshold. Drop tokens whose prob is below
+    /// `min_p * max_prob` after rep/freq/presence adjustments but before
+    /// top-k/top-p. 0.0 disables.
+    min_p: f32,
+    /// Bounded sliding-window tracker for recently emitted tokens. Exposes
+    /// per-token counts (for frequency_penalty) and O(1) `contains`. We
+    /// maintain this locally instead of reusing `inferlet::sampler::EmittedHistory`
+    /// because that SDK type only exposes `contains`/`len`, not `count` —
+    /// and frequency_penalty's definition requires a count.
+    history: HistoryTracker,
+}
+
+/// Bounded sliding-window tracker with O(1) count queries.
+///
+/// Mirrors the semantics of `inferlet::sampler::EmittedHistory` (same
+/// eviction order, same ref-count invariant) but exposes `count(token)` so
+/// the caller can apply frequency_penalty (`p *= exp(-k * count)`). Kept
+/// local so the SDK surface doesn't need a new method for one caller.
+struct HistoryTracker {
+    deque: VecDeque<u32>,
+    counts: HashMap<u32, u32>,
+    max: usize,
+}
+
+impl HistoryTracker {
+    fn new(max: usize) -> Self {
+        Self {
+            deque: VecDeque::with_capacity(max),
+            counts: HashMap::new(),
+            max,
+        }
+    }
+
+    fn push(&mut self, token: u32) {
+        if self.max == 0 {
+            return;
+        }
+        if self.deque.len() == self.max {
+            let evicted = self
+                .deque
+                .pop_front()
+                .expect("deque at capacity must have a front");
+            let c = self
+                .counts
+                .get_mut(&evicted)
+                .expect("count invariant: every deque slot has a ref-count entry");
+            *c -= 1;
+            if *c == 0 {
+                self.counts.remove(&evicted);
+            }
+        }
+        self.deque.push_back(token);
+        *self.counts.entry(token).or_insert(0) += 1;
+    }
+
+    fn count(&self, token: u32) -> u32 {
+        self.counts.get(&token).copied().unwrap_or(0)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.deque.is_empty()
+    }
 }
 
 type Vocab = (Vec<u32>, Vec<Vec<u8>>);
@@ -90,25 +159,68 @@ fn xorshift64_next(state: &mut u64) -> u64 {
     x.wrapping_mul(0x2545_F491_4F6C_DD1D)
 }
 
-/// Uniform f32 in [0.0, 1.0). 24 bits of entropy (float mantissa precision).
-#[inline]
-fn next_uniform01(state: &mut u64) -> f32 {
-    let bits = xorshift64_next(state) >> 40;
-    (bits as f32) / ((1u64 << 24) as f32)
+/// `rand_core::RngCore` adapter over the xorshift64* state. We keep our own
+/// PRNG (rather than pulling in `rand_chacha`) because it's lighter in WASM
+/// and already entropy-seeded via WASI. The adapter just exposes the state
+/// through the trait so `inferlet::sampler::weighted_sample` — which is
+/// generic over `RngCore` — can drive it.
+pub(crate) struct XorshiftRng {
+    state: u64,
+}
+
+impl XorshiftRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 { XORSHIFT_SEED_FALLBACK } else { seed },
+        }
+    }
+}
+
+impl RngCore for XorshiftRng {
+    fn next_u32(&mut self) -> u32 {
+        // High 32 bits of the 64-bit xorshift output — they mix faster than
+        // the low bits for linear-feedback generators.
+        (xorshift64_next(&mut self.state) >> 32) as u32
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        xorshift64_next(&mut self.state)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        let mut i = 0;
+        while i < dest.len() {
+            let bytes = self.next_u64().to_le_bytes();
+            let take = (dest.len() - i).min(8);
+            dest[i..i + take].copy_from_slice(&bytes[..take]);
+            i += take;
+        }
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> std::result::Result<(), rand_core::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
 }
 
 /// Options controlling the stochastic behavior of `ConstrainedSampler`.
 ///
-/// `Default` disables every filter (rep_penalty=1.0, no top_p cutoff,
-/// no top_k cap, fresh-entropy seed). Callers that want
-/// `generation_config.json` parity with Qwen2.5 should pass
-/// `{ rep_penalty: 1.05, top_p: Some(0.8), top_k: Some(20) }` — these
-/// match vLLMs full sampling pipeline and keep the stochastic draw
-/// from reaching into the long tail of the distribution (which is how
-/// Phase D1 hallucinated a bogus integration ID).
+/// `Default` disables every filter and penalty (rep=1.0, freq=0.0,
+/// presence=0.0, min_p=0.0, no top_p, no top_k, fresh-entropy seed).
+/// Callers that want `generation_config.json` parity with Qwen2.5 should
+/// pass `{ rep_penalty: 1.05, top_p: Some(0.8), top_k: Some(20) }` —
+/// these match vLLMs full sampling pipeline and keep the stochastic
+/// draw from reaching into the long tail of the distribution (which is
+/// how Phase D1 hallucinated a bogus integration ID).
 #[derive(Debug, Clone, Copy)]
 pub struct SamplerOptions {
     pub rep_penalty: f32,
+    /// OpenAI-style frequency_penalty applied in prob-space:
+    /// `p *= exp(-k * count_in_history)`. 0.0 disables.
+    pub frequency_penalty: f32,
+    /// OpenAI-style presence_penalty applied in prob-space:
+    /// `p *= exp(-k)` when the token is present in history. 0.0 disables.
+    pub presence_penalty: f32,
     /// Nucleus (top-p) cutoff: keep the smallest set of allowed tokens
     /// whose cumulative probability is >= top_p, redistribute the rest.
     /// `None` or 1.0 disables filtering.
@@ -116,6 +228,9 @@ pub struct SamplerOptions {
     /// Keep only the `top_k` highest-probability allowed tokens.
     /// `None` disables filtering.
     pub top_k: Option<u32>,
+    /// Min-p truncation. Drop tokens whose prob is below
+    /// `min_p * max_prob`. `None` or 0.0 disables.
+    pub min_p: Option<f32>,
     pub seed: Option<u64>,
 }
 
@@ -123,8 +238,11 @@ impl Default for SamplerOptions {
     fn default() -> Self {
         Self {
             rep_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
             top_p: None,
             top_k: None,
+            min_p: None,
             seed: None,
         }
     }
@@ -187,7 +305,7 @@ impl ConstrainedSampler {
         let parser = factory.create_parser(grammar);
 
         let constraint = Matcher::new(parser);
-        let rng_state = opts
+        let seed = opts
             .seed
             .filter(|s| *s != 0)
             .unwrap_or_else(initial_seed);
@@ -195,6 +313,20 @@ impl ConstrainedSampler {
             opts.rep_penalty
         } else {
             1.0
+        };
+        // frequency/presence penalties: clamp non-finite to 0 (neutral).
+        // Negative values are passed through verbatim — the OpenAI spec
+        // allows negatives (encourage repetition), so mathematically
+        // `exp(-k * count)` with k<0 amplifies; we don't override intent.
+        let frequency_penalty = if opts.frequency_penalty.is_finite() {
+            opts.frequency_penalty
+        } else {
+            0.0
+        };
+        let presence_penalty = if opts.presence_penalty.is_finite() {
+            opts.presence_penalty
+        } else {
+            0.0
         };
         // Normalize top_p: treat None, NaN, or values >= 1.0 as disabled.
         // Clamp small values to a minimum so we dont end up with a
@@ -204,147 +336,163 @@ impl ConstrainedSampler {
             _ => 1.0,
         };
         let top_k = opts.top_k.unwrap_or(0);
+        // min_p: None, NaN, or values <= 0 / >= 1 disable.
+        let min_p = match opts.min_p {
+            Some(m) if m.is_finite() && m > 0.0 && m < 1.0 => m,
+            _ => 0.0,
+        };
         ConstrainedSampler {
             inner: RefCell::new(Inner {
                 constraint,
                 eos_token_id,
-                rng_state,
+                rng: XorshiftRng::new(seed),
                 rep_penalty,
+                frequency_penalty,
+                presence_penalty,
                 top_p,
                 top_k,
-                emitted_history: VecDeque::with_capacity(DEFAULT_HISTORY_MAX),
-                history_max: DEFAULT_HISTORY_MAX,
+                min_p,
+                history: HistoryTracker::new(DEFAULT_HISTORY_MAX),
             }),
         }
     }
 }
 
+/// Apply rep/frequency/presence penalties in a single pass over `dist`.
+///
+/// Neutral values (`rep=1.0, freq=0.0, presence=0.0`) short-circuit: if all
+/// three are neutral, or if `history` is empty, this is a no-op. Otherwise
+/// each grammar-allowed token's probability is scaled by the product of
+/// whichever penalties apply to it.
+///
+/// Mathematical form (prob-space, post-softmax):
+///   rep      : `p /= rep_penalty`                   if count > 0
+///   freq     : `p *= exp(-frequency_penalty * count)` if count > 0
+///   presence : `p *= exp(-presence_penalty)`        if count > 0
+///
+/// The logit-space vLLM analogs are `logit /= rep`, `logit -= freq*count`,
+/// `logit -= presence`. Exponentiating the logit-space offset gives the
+/// prob-space multiplier used here. See the pipeline comment in `sample()`
+/// for why we can't apply the strict logit-space form from WASM.
+fn apply_prob_penalties(
+    dist: &mut [(u32, f32)],
+    history: &HistoryTracker,
+    rep_penalty: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
+) {
+    let rep_active = rep_penalty.is_finite() && (rep_penalty - 1.0).abs() > 1e-6;
+    let freq_active = frequency_penalty.is_finite() && frequency_penalty.abs() > 1e-6;
+    let pres_active = presence_penalty.is_finite() && presence_penalty.abs() > 1e-6;
+    if history.is_empty() || (!rep_active && !freq_active && !pres_active) {
+        return;
+    }
+    let pres_factor = if pres_active { (-presence_penalty).exp() } else { 1.0 };
+    for (token, prob) in dist.iter_mut() {
+        let count = history.count(*token);
+        if count == 0 {
+            continue;
+        }
+        if rep_active {
+            *prob /= rep_penalty;
+        }
+        if freq_active {
+            *prob *= (-frequency_penalty * count as f32).exp();
+        }
+        if pres_active {
+            *prob *= pres_factor;
+        }
+    }
+}
+
+/// Min-p truncation: drop any `(token, prob)` pair whose prob is below
+/// `min_p * max_prob`. Operates over a pre-sort-indifferent vec (we compute
+/// the max explicitly) so callers may call this before OR after sort.
+///
+/// `min_p <= 0.0` or `min_p >= 1.0` → no-op. Empty `dist` → no-op.
+fn apply_min_p(dist: &mut Vec<(u32, f32)>, min_p: f32) {
+    if !min_p.is_finite() || min_p <= 0.0 || min_p >= 1.0 || dist.is_empty() {
+        return;
+    }
+    let max_p = dist
+        .iter()
+        .map(|&(_, p)| p)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !max_p.is_finite() || max_p <= 0.0 {
+        return;
+    }
+    let threshold = min_p * max_p;
+    dist.retain(|&(_, p)| p >= threshold);
+}
+
 impl Sample for ConstrainedSampler {
     fn sample(&self, token_ids: &[u32], probs: &[f32]) -> u32 {
         let mut inner = self.inner.borrow_mut();
-        let res = inner.constraint.compute_mask();
-
-        if let Err(_) = res {
-            return inner.eos_token_id;
-        }
-
-        let res = res.unwrap();
-
+        let res = match inner.constraint.compute_mask() {
+            Ok(r) => r,
+            Err(_) => return inner.eos_token_id,
+        };
         if res.is_empty() {
             return inner.eos_token_id;
         }
 
-        // Collect the (id, prob) pairs allowed by the grammar mask. We
-        // then apply vLLMs full sampling pipeline before the weighted
-        // draw: rep_penalty -> top_k -> top_p -> multinomial sample. This
-        // matches Qwen2.5s generation_config.json (rep_penalty=1.05,
-        // top_k=20, top_p=0.8) which vLLM auto-injects at model load;
-        // without top_k/top_p the long tail of the distribution lets
-        // stochastic sampling pick truly rare tokens and send the model
-        // off-rails (Phase D1: hallucinated integration IDs).
-        // rep_penalty: divide the prob of any token in the recent history
-        // by `penalty`, matching `repetition_penalty` spiritually. NB: this
-        // is an approximation — vLLMs formulation scales LOGITS
-        // (`logit /= penalty` for positive logits) which is strictly
-        // stronger for high-confidence tokens. We cannot replicate that
-        // here because the engine returns post-softmax probs and the true
-        // logit (which depends on the unknown normalization constant Z) is
-        // not recoverable from probs alone. Closing that gap is F3 in
-        // hc task #23 — it requires engine-side penalty application.
+        // Collect only grammar-allowed, positive-prob (id, prob) pairs; the
+        // SDK primitives operate on the resulting sparse distribution.
+        let mut dist: Vec<(u32, f32)> = token_ids
+            .iter()
+            .zip(probs.iter())
+            .filter_map(|(&tid, &p)| (res.is_allowed(tid) && p > 0.0).then_some((tid, p)))
+            .collect();
+
+        // Full sampling pipeline in prob-space, matching what vLLM applies
+        // on the engine side for non-grammar paths:
+        //   1. rep_penalty   — divide p by penalty for history tokens
+        //   2. freq_penalty  — p *= exp(-k * count_in_history)
+        //   3. presence_pen  — p *= exp(-k) when count > 0
+        //   4. sort desc
+        //   5. min_p         — drop p < min_p * max_p
+        //   6. top_k         — keep top K
+        //   7. top_p         — keep nucleus
+        //   8. weighted draw
         //
-        // Phase D1 evidence: this prob-space penalty + top_p/top_k
-        // eliminates hallucinations (no more "1234567890" integration
-        // IDs). But Phase D2 showed 2/3 trials still produce the specific
-        // INT-004 alternation duplicate, which needs the stronger
-        // logit-space effect.
-        let rep_penalty = inner.rep_penalty;
-        let penalize = rep_penalty > 1.0 && !inner.emitted_history.is_empty();
-        let mut allowed: Vec<(u32, f32)> = Vec::with_capacity(token_ids.len());
-        for (i, &tid) in token_ids.iter().enumerate() {
-            if res.is_allowed(tid) {
-                let mut p = probs[i];
-                if penalize && inner.emitted_history.contains(&tid) {
-                    p /= rep_penalty;
-                }
-                if p > 0.0 {
-                    allowed.push((tid, p));
-                }
-            }
-        }
+        // Everything is approximate — `Sampler::Custom` only sees
+        // post-softmax probs, so the strict vLLM logit-space formulation
+        // (`logit -= k * count`) can't be reproduced exactly. The prob-
+        // space equivalents below are multiplicatively-monotone analogs
+        // that match sign and qualitative shape; the full fix requires
+        // engine-side penalty application, tracked as F3 in hc task #23.
+        //
+        // Qwen2.5's generation_config.json ships rep_penalty=1.05,
+        // top_k=20, top_p=0.8 — without them the stochastic draw reaches
+        // the long tail and hallucinates (Phase D1 evidence).
+        apply_prob_penalties(
+            &mut dist,
+            &inner.history,
+            inner.rep_penalty,
+            inner.frequency_penalty,
+            inner.presence_penalty,
+        );
+        dist.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        apply_min_p(&mut dist, inner.min_p);
+        apply_top_k(&mut dist, inner.top_k);
+        apply_top_p(&mut dist, inner.top_p);
 
-        // top_k: keep the K highest-probability allowed tokens. 0 disables.
-        // We sort the full allowed set descending so top_p can then walk
-        // in-order. sort_unstable_by is fine because identical probs are
-        // interchangeable for the downstream draw.
-        if !allowed.is_empty() {
-            allowed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let k = inner.top_k as usize;
-            if k > 0 && allowed.len() > k {
-                allowed.truncate(k);
-            }
-            // top_p: keep the shortest prefix whose cumulative mass >= top_p,
-            // measured over the (already post-rep_penalty, post-top_k)
-            // restricted distribution. This is the standard "nucleus" recipe;
-            // we normalize the cumulative against `sum_kept` rather than
-            // against the pre-filter total because rep_penalty has already
-            // shifted mass around.
-            let top_p = inner.top_p;
-            if top_p < 1.0 {
-                let sum: f32 = allowed.iter().map(|(_, p)| *p).sum();
-                if sum > 0.0 {
-                    let target = top_p * sum;
-                    let mut acc = 0.0f32;
-                    let mut keep = allowed.len();
-                    for (i, (_, p)) in allowed.iter().enumerate() {
-                        acc += *p;
-                        if acc >= target {
-                            keep = i + 1;
-                            break;
-                        }
-                    }
-                    if keep < allowed.len() {
-                        allowed.truncate(keep);
-                    }
-                }
-            }
-        }
-        let total: f32 = allowed.iter().map(|(_, p)| *p).sum();
-
-        let sampled_token_id = if allowed.is_empty() || !total.is_finite() || total <= 0.0 {
-            // No allowed token in the sparse distribution. Fall back to the
-            // first token in the full-vocab mask (same behavior as before).
+        let sampled_token_id = if dist.is_empty() {
+            // No allowed token with positive mass. Fall back to the first
+            // token in the full-vocab grammar mask (same behavior as the
+            // pre-refactor code).
             res.first_bit_set().unwrap_or(inner.eos_token_id as usize) as u32
-        } else if allowed.len() == 1 {
-            allowed[0].0
         } else {
-            let u = next_uniform01(&mut inner.rng_state) * total;
-            let mut acc = 0.0f32;
-            // Last-element default covers floating-point rounding where
-            // `acc` never quite reaches `u`.
-            let mut picked = allowed[allowed.len() - 1].0;
-            for &(id, p) in &allowed {
-                acc += p;
-                if acc >= u {
-                    picked = id;
-                    break;
-                }
-            }
-            picked
+            weighted_sample(&dist, &mut inner.rng)
         };
 
-        // Commit the chosen token to advance the parser state.
-        // This is critical even for fallback tokens — without it the grammar
-        // never advances and every step returns the same fallback.
+        // Commit the chosen token to advance the parser state. Critical even
+        // for fallback tokens — without it the grammar never advances and
+        // every step returns the same fallback.
         let _ = inner.constraint.consume_token(sampled_token_id);
 
-        // Track emitted token for future repetition-penalty lookups. Bound
-        // the window so `.contains()` stays cheap and memory is fixed.
-        if inner.history_max > 0 {
-            if inner.emitted_history.len() == inner.history_max {
-                inner.emitted_history.pop_front();
-            }
-            inner.emitted_history.push_back(sampled_token_id);
-        }
+        // Track emitted token for future repetition-penalty lookups.
+        inner.history.push(sampled_token_id);
 
         sampled_token_id
     }
@@ -665,30 +813,15 @@ fn unescape_non_printable(bytes: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod rng_tests {
-    //! Unit tests for the xorshift RNG and the weighted-draw primitive
-    //! used by `ConstrainedSampler::sample`. These tests intentionally do
-    //! NOT exercise the `Matcher`/llguidance path — that requires a full
-    //! tokenizer + grammar. They pin the weighted-draw math itself so a
-    //! future refactor cannot silently regress to argmax.
+    //! Unit tests for the xorshift RNG backend + the XorshiftRng adapter
+    //! that plumbs it into `rand_core::RngCore`. We intentionally do NOT
+    //! exercise `ConstrainedSampler::sample()` directly — that requires a
+    //! full tokenizer + grammar to construct a live `Matcher`. The math
+    //! itself (rep_penalty / top_k / top_p / weighted_sample) is exhaustively
+    //! covered by `inferlet::sampler::primitives`'s own unit tests; these
+    //! tests pin only what is *new* and *pieclaw-local*: the RNG backend and
+    //! its adapter.
     use super::*;
-
-    /// Port of the weighted-sample math from `sample()` so we can test it
-    /// without a live `Matcher`.
-    fn weighted_draw(state: &mut u64, allowed: &[(u32, f32)]) -> u32 {
-        assert!(!allowed.is_empty());
-        let total: f32 = allowed.iter().map(|(_, p)| *p).sum();
-        let u = next_uniform01(state) * total;
-        let mut acc = 0.0f32;
-        let mut picked = allowed[allowed.len() - 1].0;
-        for &(id, p) in allowed {
-            acc += p;
-            if acc >= u {
-                picked = id;
-                break;
-            }
-        }
-        picked
-    }
 
     #[test]
     fn xorshift_advances_and_is_deterministic_for_fixed_seed() {
@@ -704,230 +837,151 @@ mod rng_tests {
     }
 
     #[test]
-    fn uniform01_stays_in_range() {
-        let mut s = 0xDEADBEEF_u64;
-        for _ in 0..1024 {
-            let u = next_uniform01(&mut s);
-            assert!((0.0..1.0).contains(&u), "uniform out of range: {u}");
-        }
+    fn xorshift_rng_adapter_is_deterministic_for_fixed_seed() {
+        let mut r1 = XorshiftRng::new(0x1234_5678);
+        let mut r2 = XorshiftRng::new(0x1234_5678);
+        let a: Vec<u32> = (0..16).map(|_| r1.next_u32()).collect();
+        let b: Vec<u32> = (0..16).map(|_| r2.next_u32()).collect();
+        assert_eq!(a, b, "same seed must produce same u32 sequence");
     }
 
     #[test]
-    fn weighted_draw_follows_weights() {
-        // {A:0.7, B:0.3} over 50k trials should land within 2% of 70/30.
-        let allowed = vec![(10u32, 0.7), (20u32, 0.3)];
-        let mut s = 0x12345678_u64;
-        let n = 50_000;
-        let mut count_a = 0;
-        for _ in 0..n {
-            if weighted_draw(&mut s, &allowed) == 10 {
-                count_a += 1;
-            }
-        }
-        let ratio = count_a as f32 / n as f32;
+    fn xorshift_rng_adapter_zero_seed_is_rescued() {
+        // A zero seed must not stick the state at zero. The adapter's
+        // constructor + the xorshift64* rescue branch cooperate to keep the
+        // stream live.
+        let mut r = XorshiftRng::new(0);
+        let values: Vec<u32> = (0..4).map(|_| r.next_u32()).collect();
         assert!(
-            (ratio - 0.7).abs() < 0.02,
-            "expected ~0.70 A, got {ratio} ({count_a}/{n})"
+            values.iter().any(|&v| v != 0),
+            "zero-seeded RNG produced all zeros"
         );
     }
 
     #[test]
-    fn weighted_draw_non_degenerate_for_close_probs() {
-        // Argmax would pick A every time. Weighted draw must produce both.
-        let allowed = vec![(1u32, 0.51), (2u32, 0.49)];
-        let mut s = 0x1_u64;
-        let mut seen_a = false;
-        let mut seen_b = false;
-        for _ in 0..200 {
-            match weighted_draw(&mut s, &allowed) {
-                1 => seen_a = true,
-                2 => seen_b = true,
-                _ => unreachable!(),
-            }
-            if seen_a && seen_b {
-                break;
-            }
-        }
-        assert!(seen_a && seen_b, "weighted draw was effectively greedy");
-    }
-
-    #[test]
-    fn weighted_draw_single_id_always_picks_it() {
-        let allowed = vec![(42u32, 0.33)];
-        let mut s = 0xABCD_u64;
-        for _ in 0..32 {
-            assert_eq!(weighted_draw(&mut s, &allowed), 42);
-        }
-    }
-
-    /// Port of the penalty application from `sample()` — prob-space
-    /// `p /= penalty` for tokens in history. This is an approximation of
-    /// vLLMs logit-space formula; see the long comment in `sample()`.
-    fn apply_rep_penalty(
-        allowed: &[(u32, f32)],
-        history: &[u32],
-        penalty: f32,
-    ) -> Vec<(u32, f32)> {
-        if penalty <= 1.0 || history.is_empty() {
-            return allowed.to_vec();
-        }
-        let hist_set: HashSet<u32> = history.iter().copied().collect();
-        allowed
-            .iter()
-            .map(|&(id, p)| {
-                let q = if hist_set.contains(&id) { p / penalty } else { p };
-                (id, q)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn rep_penalty_shifts_mass_away_from_recent_tokens() {
-        // Uniform {A:0.5, B:0.5}, A in history, penalty=1.05. A->0.476
-        // after /=1.05, renorm total = 0.976, new B share = 0.5/0.976 =
-        // 0.512. Expect B ~51% in 50k trials.
-        let allowed = vec![(100u32, 0.5), (200u32, 0.5)];
-        let history = vec![100u32];
-        let penalized = apply_rep_penalty(&allowed, &history, 1.05);
-        let mut s = 0xFEED_u64;
-        let n = 50_000;
-        let mut count_b = 0;
+    fn pipeline_with_xorshift_rng_terminates_and_respects_weights() {
+        // Smoke-test the full `sample()` pipeline (minus the Matcher) with
+        // the adapter-backed RNG. {10:0.9, 20:0.1} with no filtering — token
+        // 10 should dominate over 10k draws.
+        let mut rng = XorshiftRng::new(0xFEEDF00D);
+        let mut count10 = 0usize;
+        let n = 10_000;
         for _ in 0..n {
-            if weighted_draw(&mut s, &penalized) == 200 {
-                count_b += 1;
+            let history = HistoryTracker::new(16);
+            let mut dist: Vec<(u32, f32)> = vec![(10, 0.9), (20, 0.1)];
+            apply_prob_penalties(&mut dist, &history, 1.0, 0.0, 0.0);
+            dist.sort_unstable_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            apply_min_p(&mut dist, 0.0);
+            apply_top_k(&mut dist, 0);
+            apply_top_p(&mut dist, 1.0);
+            if weighted_sample(&dist, &mut rng) == 10 {
+                count10 += 1;
             }
         }
-        let ratio = count_b as f32 / n as f32;
+        let frac = count10 as f64 / n as f64;
         assert!(
-            (0.50..=0.53).contains(&ratio),
-            "expected B ratio ~0.512 with rep_penalty=1.05 (prob-space), got {ratio}"
+            (0.86..0.94).contains(&frac),
+            "expected ~0.9 for token 10 through XorshiftRng, got {frac}"
         );
     }
 
     #[test]
-    fn rep_penalty_disabled_when_penalty_is_one() {
-        let allowed = vec![(1u32, 0.5), (2u32, 0.5)];
-        let history = vec![1u32, 1u32, 1u32];
-        let penalized = apply_rep_penalty(&allowed, &history, 1.0);
-        assert_eq!(penalized, allowed);
-    }
-
-    /// Replicates the top_k/top_p filtering path from `sample()` so we
-    /// can test it without a live Matcher. Mirrors the order in sample():
-    /// sort desc -> truncate top_k -> truncate at top_p cumulative mass.
-    fn filter_top_k_top_p(
-        mut allowed: Vec<(u32, f32)>,
-        top_k: usize,
-        top_p: f32,
-    ) -> Vec<(u32, f32)> {
-        allowed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        if top_k > 0 && allowed.len() > top_k {
-            allowed.truncate(top_k);
-        }
-        if top_p < 1.0 {
-            let sum: f32 = allowed.iter().map(|(_, p)| *p).sum();
-            if sum > 0.0 {
-                let target = top_p * sum;
-                let mut acc = 0.0;
-                let mut keep = allowed.len();
-                for (i, (_, p)) in allowed.iter().enumerate() {
-                    acc += *p;
-                    if acc >= target {
-                        keep = i + 1;
-                        break;
-                    }
-                }
-                if keep < allowed.len() {
-                    allowed.truncate(keep);
-                }
-            }
-        }
-        allowed
+    fn history_tracker_refcount_matches_sdk_emittedhistory() {
+        // Same invariants as `inferlet::sampler::EmittedHistory::contains`:
+        // duplicates hold the token in the window until every slot is
+        // evicted. Also validates `count()`, which EmittedHistory doesn't
+        // expose and which frequency_penalty depends on.
+        let mut h = HistoryTracker::new(3);
+        h.push(5);
+        h.push(5);
+        h.push(5);
+        assert_eq!(h.count(5), 3);
+        h.push(6);
+        assert_eq!(h.count(5), 2);
+        h.push(7);
+        assert_eq!(h.count(5), 1);
+        h.push(8);
+        assert_eq!(h.count(5), 0);
+        assert_eq!(h.count(8), 1);
     }
 
     #[test]
-    fn top_k_keeps_highest_probability_tokens() {
-        let allowed = vec![(1, 0.1), (2, 0.5), (3, 0.3), (4, 0.08), (5, 0.02)];
-        let kept = filter_top_k_top_p(allowed, 2, 1.0);
-        assert_eq!(kept.len(), 2);
-        assert_eq!(kept[0].0, 2); // 0.5
-        assert_eq!(kept[1].0, 3); // 0.3
+    fn apply_prob_penalties_rep_only_matches_old_behavior() {
+        // With freq=0, presence=0, the helper degenerates to the old
+        // `apply_repetition_penalty` semantics (p /= rep for history tokens).
+        let mut h = HistoryTracker::new(8);
+        h.push(1);
+        let mut dist = vec![(1u32, 0.5f32), (2, 0.3), (3, 0.2)];
+        apply_prob_penalties(&mut dist, &h, 1.1, 0.0, 0.0);
+        let p1 = dist.iter().find(|(t, _)| *t == 1).unwrap().1;
+        assert!((p1 - 0.5 / 1.1).abs() < 1e-6);
+        assert!((dist.iter().find(|(t, _)| *t == 2).unwrap().1 - 0.3).abs() < 1e-6);
     }
 
     #[test]
-    fn top_k_zero_disables_filter() {
-        let allowed = vec![(1, 0.5), (2, 0.5)];
-        let kept = filter_top_k_top_p(allowed, 0, 1.0);
-        assert_eq!(kept.len(), 2);
+    fn apply_prob_penalties_frequency_scales_with_count() {
+        // freq=0.5 with count=2 → multiplier = exp(-0.5 * 2) = exp(-1.0)
+        let mut h = HistoryTracker::new(8);
+        h.push(1);
+        h.push(1);
+        let mut dist = vec![(1u32, 0.5f32), (2, 0.5)];
+        apply_prob_penalties(&mut dist, &h, 1.0, 0.5, 0.0);
+        let p1 = dist.iter().find(|(t, _)| *t == 1).unwrap().1;
+        let expected = 0.5f32 * (-1.0f32).exp();
+        assert!((p1 - expected).abs() < 1e-6, "got {p1}, want {expected}");
+        // token 2 untouched
+        assert!((dist.iter().find(|(t, _)| *t == 2).unwrap().1 - 0.5).abs() < 1e-6);
     }
 
     #[test]
-    fn top_p_keeps_shortest_nucleus() {
-        // Mass: 0.5 + 0.3 + 0.1 + 0.08 + 0.02 = 1.0. top_p=0.8 needs
-        // cumulative >= 0.8, so after sorting desc we keep {0.5, 0.3}.
-        let allowed = vec![(1, 0.1), (2, 0.5), (3, 0.3), (4, 0.08), (5, 0.02)];
-        let kept = filter_top_k_top_p(allowed, 0, 0.8);
-        assert_eq!(kept.len(), 2, "nucleus should be {{0.5, 0.3}} for top_p=0.8");
-        assert_eq!(kept[0].0, 2);
-        assert_eq!(kept[1].0, 3);
+    fn apply_prob_penalties_presence_is_count_independent() {
+        // presence=1.0 with count=1 or count=5 gives the same multiplier
+        // exp(-1.0). Confirms presence doesn't scale with count.
+        let mut h1 = HistoryTracker::new(8);
+        h1.push(1);
+        let mut h5 = HistoryTracker::new(8);
+        for _ in 0..5 { h5.push(1); }
+        let mut d1 = vec![(1u32, 0.5f32)];
+        let mut d5 = vec![(1u32, 0.5f32)];
+        apply_prob_penalties(&mut d1, &h1, 1.0, 0.0, 1.0);
+        apply_prob_penalties(&mut d5, &h5, 1.0, 0.0, 1.0);
+        assert!((d1[0].1 - d5[0].1).abs() < 1e-6,
+            "presence should be count-independent: count=1 → {}, count=5 → {}",
+            d1[0].1, d5[0].1);
     }
 
     #[test]
-    fn top_p_one_disables_filter() {
-        let allowed = vec![(1, 0.5), (2, 0.3), (3, 0.2)];
-        let kept = filter_top_k_top_p(allowed.clone(), 0, 1.0);
-        assert_eq!(kept.len(), 3);
+    fn apply_prob_penalties_no_op_when_history_empty() {
+        let h = HistoryTracker::new(8);
+        let mut dist = vec![(1u32, 0.5f32), (2, 0.5)];
+        apply_prob_penalties(&mut dist, &h, 1.5, 0.5, 1.0);
+        assert_eq!(dist, vec![(1u32, 0.5), (2u32, 0.5)]);
     }
 
     #[test]
-    fn top_k_then_top_p_composed() {
-        // 10 tokens; top_k=5 keeps top 5 by mass, then top_p=0.7 cuts
-        // further. Sorted probs: 0.35, 0.25, 0.15, 0.10, 0.08, ... =
-        // sum_kept=0.93; target=0.7*0.93=0.651. Cumulative: 0.35, 0.60,
-        // 0.75 >= 0.651 -> keep 3.
-        let allowed = vec![
-            (1, 0.02), (2, 0.35), (3, 0.01), (4, 0.15), (5, 0.25),
-            (6, 0.08), (7, 0.10), (8, 0.01), (9, 0.02), (10, 0.01),
-        ];
-        let kept = filter_top_k_top_p(allowed, 5, 0.7);
-        assert_eq!(kept.len(), 3, "expected 3 tokens after top_k=5 then top_p=0.7");
-        assert_eq!(kept[0].0, 2); // 0.35
-        assert_eq!(kept[1].0, 5); // 0.25
-        assert_eq!(kept[2].0, 4); // 0.15
+    fn apply_min_p_drops_below_threshold() {
+        // max=0.5, min_p=0.1 → threshold=0.05 → keep 0.5, 0.3, 0.1; drop 0.01
+        let mut dist = vec![(1u32, 0.5f32), (2, 0.3), (3, 0.1), (4, 0.01)];
+        apply_min_p(&mut dist, 0.1);
+        assert_eq!(dist.len(), 3);
+        assert!(dist.iter().all(|&(t, _)| t != 4));
     }
 
     #[test]
-    fn top_p_never_returns_empty_when_input_nonempty() {
-        // Even with a very small top_p, at least one token must survive
-        // (the highest-prob one always satisfies cumulative >= target on
-        // its own).
-        let allowed = vec![(1, 0.9), (2, 0.05), (3, 0.05)];
-        for p in [0.01_f32, 0.1, 0.5, 0.99] {
-            let kept = filter_top_k_top_p(allowed.clone(), 0, p);
-            assert!(!kept.is_empty(), "top_p={p} produced empty set");
-        }
+    fn apply_min_p_zero_is_no_op() {
+        let mut dist = vec![(1u32, 0.5f32), (2, 0.001)];
+        apply_min_p(&mut dist, 0.0);
+        assert_eq!(dist.len(), 2);
     }
 
     #[test]
-    fn rep_penalty_pushes_toward_alternatives_on_heavy_repeat() {
-        // Simulate the INT-004 case: one token dominates (0.8) and is in
-        // history. With penalty=1.5: 0.8/1.5 = 0.533. Renormalized total =
-        // 0.733. Alt share = 0.2 / 0.733 = 0.273.
-        let allowed = vec![(77u32, 0.8), (99u32, 0.2)];
-        let history = vec![77u32];
-        let penalized = apply_rep_penalty(&allowed, &history, 1.5);
-        let mut s = 0xC0DE_u64;
-        let n = 20_000;
-        let mut count_alt = 0;
-        for _ in 0..n {
-            if weighted_draw(&mut s, &penalized) == 99 {
-                count_alt += 1;
-            }
-        }
-        let ratio = count_alt as f32 / n as f32;
-        assert!(
-            (0.22..=0.33).contains(&ratio),
-            "expected alt ratio ~0.27 with prob-space penalty=1.5, got {ratio}"
-        );
+    fn apply_min_p_keeps_max_element() {
+        // Even at min_p=0.99 the max-prob element must survive — it defines
+        // the threshold (threshold = min_p * max), so max >= threshold.
+        let mut dist = vec![(1u32, 0.5f32), (2, 0.5), (3, 0.001)];
+        apply_min_p(&mut dist, 0.99);
+        assert!(dist.iter().any(|&(t, _)| t == 1 || t == 2));
     }
 }

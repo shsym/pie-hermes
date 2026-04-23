@@ -1,41 +1,49 @@
 //! Block-level prefix cache inside the inferlet.
 //!
-//! ## ⚠️ DISABLED — cross-instance history reconstruction is broken
+//! ## Status
 //!
-//! `lookup_longest_prefix` currently returns `None` unconditionally.
-//! Measured behavior on D3 + D1-warmup (fresh A40 pod, 2026-04-10):
+//! Cross-session lookup is LIVE.  Chat requests that share a prefix with
+//! a previously warmed sequence hit `lookup_longest_prefix` and import
+//! the matching KV pages instead of re-prefilling.  Verified 2026-04-22
+//! on A100-80GB with Qwen3-8B and Qwen2.5-72B-Instruct-AWQ via
+//! `scripts/bench-block-cache-repro.py` (D3 @ c=1/4/8/16, 390 total
+//! requests, 100% `fallback_reason=block_cache_hit`, zero
+//! cross-contamination, zero engine errors).
 //!
-//! - req0/req1/req3 are coherent, but **req2 is semantically off**
-//!   even after capping match depth to leave a full-block tail.
-//! - Lowering the cap changed the wrong-output content (math answer →
-//!   "ticket prices report") but did not restore correctness.
+//! Save-side runs in the warmup handler (`/v1/pie/prompt-cache/chat-prefix:warm`)
+//! only.  Calling `save_ctx_blocks` on every chat request floods the
+//! runtime's export registry — each chat mutates the final chain hash
+//! via its user turn, so `already_exported` is always false and
+//! `queue.export_kv_pages` accumulates unbounded per-request entries,
+//! producing `ExportSync FAILED / PointerNotAllocated` errors at c>=4.
+//! Until an LRU / runtime-capacity strategy lands, chat-path save is
+//! off; clients that want cross-session reuse should call the warmup
+//! endpoint once per shared prefix.
 //!
-//! Root cause (traced in `pie-vllm/overlay/pie/src/pie_worker/vllm_sequence_tracker.py`):
-//! the Python tracker reconstructs `full_prompt_token_ids` for a new
-//! request by walking `blocks_per_req[i]` against `_active_requests`
-//! and copying a sibling's `_token_history` slice of length
-//! `effective_cached`.  When the warmup instance has already been
-//! cleaned up (cleanup_instance → finish_by_identity), the walk instead
-//! latches onto a still-live sibling that shares the **stable system
-//! prefix** only (e.g. req0).  The tracker then copies the sibling's
-//! divergent tokens as if they were the prefix, creating a mismatch
-//! between Python's reconstructed history and the KV data actually
-//! sitting in the imported pages.  vLLM attends to the wrong context
-//! → output drifts to whatever the corrupted context suggests.
+//! ## Historical — 2026-04-10 disable and why it no longer applies
 //!
-//! The other working paths (`session_kv`, stable-only prefix
-//! checkpoint, lazy prewarm) avoid this either by running warmup in the
-//! same instance as the request, or by keeping the tail large enough
-//! that the divergent copied history falls below `effective_cached`.
+//! `lookup_longest_prefix` was disabled in commit `e26af34` (2026-04-10)
+//! on the hypothesis that Python's `vllm_sequence_tracker.py` would
+//! corrupt cross-instance imports by sibling-walking a still-live request
+//! whose block IDs aliased the imported pages: the tracker would copy
+//! the sibling's divergent `_token_history` slice as if it were the
+//! imported prefix, and vLLM would attend to the wrong context.
+//! Observed signature on a D3 + D1-warmup run at the time: req2 of 4
+//! concurrent requests emitting "ticket prices report" instead of the
+//! intended math answer.
 //!
-//! A proper fix requires either (1) teaching the tracker to refuse the
-//! sibling walk when block IDs beyond the shared prefix don't match, or
-//! (2) sending the full prefix token IDs from the inferlet side so
-//! Python never has to reconstruct.  Until one of those lands, block
-//! cache must stay off in the hot path.  The save side is kept (it is
-//! harmless: saving chain-hash → export-name entries doesn't affect
-//! generation), so a future fix can re-enable lookup without touching
-//! the write path.
+//! Eighteen hours later, pie-vllm commit `9118d46` (2026-04-11) added
+//! an `IMPORTED-CTX` branch to the overlay tracker: when `is_new AND
+//! existing_len == 0 AND effective_cached > 0 AND identity_key not in
+//! token_history`, the tracker seeds `token_history` with
+//! `[0] * effective_cached`.  `num_computed_tokens` lands at
+//! `effective_cached`, so vLLM only embeds
+//! `prompt_token_ids[num_computed_tokens:]` — the zero placeholders are
+//! never read by the model.  The sibling-walk branch
+//! (`vllm_sequence_tracker.py` lines 425-454) is unreachable for
+//! cross-session imports under this guard.  The task #27 pod
+//! verification exercised exactly that failure scenario and found zero
+//! KV cross-contamination across 390 concurrent requests.
 //!
 //! ## Design
 //!
@@ -134,9 +142,47 @@ fn req_name(h: &[u8; 32]) -> String {
 ///
 /// We stop at the first miss.  Gap-and-resume is not worth the SDK
 /// complexity (mixed import + compute mid-context is not supported).
-pub fn lookup_longest_prefix(_tokens: &[u32], _page_size: usize) -> Option<(String, usize)> {
-    // Disabled — see the ⚠️ note at the top of this module.
-    None
+///
+/// The deepest match is capped at `num_blocks - 1` so the caller always
+/// has at least `page_size` tokens of fresh tail to re-prefill through
+/// the model.  Importing the entire request would leave `ctx.fill_tokens`
+/// with nothing to compute, and downstream paths assume the first forward
+/// pass does at least one token of real work.
+///
+/// Re-enabled under task #27 after the pie-vllm `IMPORTED-CTX` tracker
+/// branch (commit `9118d46`, 2026-04-11) made the original sibling-walk
+/// corruption path unreachable for cross-session imports.  See the
+/// "Historical" section in the module docstring.
+pub fn lookup_longest_prefix(tokens: &[u32], page_size: usize) -> Option<(String, usize)> {
+    if page_size == 0 || tokens.len() < 2 * page_size {
+        // Need at least 2 blocks: one to match, one for fresh tail.
+        return None;
+    }
+    let num_blocks = tokens.len() / page_size;
+    let max_cached_pages = num_blocks - 1;
+
+    let mut chain = [0u8; 32];
+    let mut best: Option<(String, usize)> = None;
+    for i in 0..num_blocks {
+        let block = &tokens[i * page_size..(i + 1) * page_size];
+        chain = chain_hash(&chain, block);
+        let key = blk_key(&chain);
+        let Some(json) = inferlet::store_get(&key) else {
+            break;
+        };
+        let Ok(entry) = serde_json::from_str::<LookupEntry>(&json) else {
+            break;
+        };
+        let capped_pages = entry.pages.min(max_cached_pages);
+        if capped_pages > 0 {
+            best = Some((entry.req, capped_pages));
+        }
+        // Deeper blocks can't beat the cap — stop walking.
+        if entry.pages >= max_cached_pages {
+            break;
+        }
+    }
+    best
 }
 
 /// Save the current context's prefill blocks into the block cache.
