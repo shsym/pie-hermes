@@ -287,20 +287,33 @@ the specific naming scheme is pie-hermes business. Task #28 decides.
 
 **Added:** 2026-04-23, Phase 3.0 (pie-hermes).
 
-**Scope-limitation upfront:** this divergence ships DETECTION + TELEMETRY
-ONLY. The KV path is unchanged. The registered pages from divergence #7
-still sit idle; the normal prefill runs. See "Why not actual prefill-skip
-yet" below.
+**Amended:** 2026-04-23 (same session), Phase 3.0 rescope. The original
+framing ("substrate for a deferred mid-stream prefill-skip") was
+invalidated during implementation — see "Rescope history" below. The
+mechanism is unchanged; what it *measures* has been reframed.
 
-**Reason:** Phase 2.1 registered context-section KV pages as named
-KV-prefix handles but did not consume them. Phase 3.0 closes the
-observability loop: the inferlet hashes every inbound `role:"tool"`
-message body, looks it up against the handle table, and reports the
-matched-token count so a capture-run can verify that (a) hermes-agent's
-boot-time registrar reached the inferlet, (b) the body-hash wire format
-matches across Python and Rust, and (c) the `read_context` tool path
-delivers bodies whose hashes line up with what was registered. Those
-invariants are preconditions for any future prefill-skip work.
+**Scope-limitation upfront:** this divergence ships DETECTION +
+TELEMETRY ONLY. The KV path is unchanged. The registered pages from
+divergence #7 still sit idle; the normal prefill runs. Phase 3.0 is now
+a characterization experiment — measuring the baseline behavior of the
+existing caches under synthetic pressure — not groundwork for a new KV
+mechanism. See "Rescope history" below.
+
+**Reason:** the telemetry field is the discriminator for the Phase-3.0
+APC-pressure benchmark (`bench/drive_pressure.py`, `bench/analyze_
+pressure.py`). Per-request it answers: did THIS tool-result body land
+on a registered (section_id, body_hash)? Cross-referenced against
+`pie_cache.prefill_tokens_skipped` it tells us whether existing
+caches (block_cache, session_kv, prefix_checkpoint) already covered
+the body's prefill, or whether a body-targeted mechanism would add
+savings on top.
+
+Secondary uses preserved from the original framing: verifies (a)
+hermes-agent's boot-time registrar reached the inferlet, (b) the
+body-hash wire format matches across Python and Rust, (c) the
+`read_context` tool path delivers bodies whose hashes line up with
+what was registered. Those were preconditions for prefill-skip; they
+are now preconditions for interpreting the benchmark's findings.
 
 **Surface:**
 - `src/context_section.rs`: new `detect_tool_result_matches(messages,
@@ -338,46 +351,72 @@ arguments. Match is purely on the `(section_id, body_hash)` pair parsed
 out of the tool-result JSON envelope. Server-side tool dispatch is
 explicitly deferred (task #32 trigger #3).
 
-**Why not actual prefill-skip yet:** the KV pages registered under
-divergence #7 are exported from a context built by `ctx.fill_system(body)`
-— so they are (a) wrapped in `<|im_start|>system\n…<|im_end|>\n` role
-markers at the token level and (b) RoPE-rotated for absolute positions
-`0..N`. A `role:"tool"` span in a real chat render has DIFFERENT role
-markers (`<|im_start|>tool\n…`) and lives at absolute position `M..M+N`
-where `M` is the length of the system+user+assistant(tool_call) prefix.
-Neither mismatch is fixable with the current SDK surface:
+**Rescope history (why the original "substrate for prefill-skip"
+framing didn't survive).** The plan's prefill-skip path assumed a
+future mid-stream KV splice. Two blockers surfaced:
 
-- `Context::from_imported_state*` is prefix-only — it builds a new
-  Context from imported KV and lets you `fill_tokens` on top; there is
-  no API for splicing imported KV into the middle of an existing token
-  stream.
-- Imported K tensors are not re-rotated (`from_imported_state_with_
-  positions` comment: "flashinfer does not re-apply RoPE …the rewritten
-  value is only ever read by `prepare_forward_pass` to derive
-  `last_pos_id + 1` for the new tokens"). So even if mid-stream splice
-  were possible, the K values baked at positions `0..N` would produce
-  incorrect attention at positions `M..M+N`.
+1. **RoPE positional wall.** KV pages registered via divergence #7
+   are exported from a context built by `ctx.fill_system(body)`, so
+   they are (a) wrapped in `<|im_start|>system\n…<|im_end|>\n` role
+   markers at the token level and (b) RoPE-rotated for absolute
+   positions `0..N`. A `role:"tool"` span in a real chat render has
+   DIFFERENT role markers (`<|im_start|>tool\n…`) and lives at
+   absolute position `M..M+N`. Fixing either requires SDK surface
+   that doesn't exist: `Context::from_imported_state*` is prefix-only,
+   and `from_imported_state_with_positions` explicitly notes
+   "flashinfer does not re-apply RoPE … the rewritten value is only
+   ever read by `prepare_forward_pass` to derive `last_pos_id + 1`
+   for the new tokens." K values baked at positions `0..N` produce
+   incorrect attention at positions `M..M+N`.
 
-Closing this gap requires one of:
-1. New SDK surface for "splice KV at arbitrary positions with K
-   re-rotation" (coordinate via task #28 — affects pieclaw too).
-2. Modify the register path to export raw body tokens (drop the
-   `fill_system` wrap) AND arrange the chat render so bodies land at
-   position 0 — either via a protocol change (agent-side, explicitly a
-   Phase-3.0 non-goal) or via a fork of the chat template that pins
-   tool-result bodies to the prefix.
-3. Accept non-zero behavioral diff and import with positional drift —
-   rejected by the Phase-3.0 zero-diff verification gate.
+2. **Existing caches may already cover this.** pie-vllm does NOT
+   vendor vanilla vLLM APC — `pie_worker/vllm_runtime.py` comments:
+   "KV export/import (prefix_caching): Only attention-layer KV is
+   exported" — cross-session reuse is gated by explicit
+   `export_kv_pages` + named-handle imports. The hermes-inferlet-side
+   `block_cache::lookup_longest_prefix` is LIVE for lookup, but
+   save-side is OFF on the chat path (disabled after an unbounded
+   export-growth incident; see `src/block_cache.rs` top-of-module
+   note). The net effect is: cross-session reuse for a chat request's
+   tool-result body depends on whether a prior `/v1/pie/prompt-cache/
+   chat-prefix:warm` pre-populated the shared prefix, not on Phase
+   2.1's register route (which never had an import path anyway).
 
-Phase 3.0 takes path (0): observe the preconditions first; decide
-between (1)–(3) at the Phase 3.1 boundary informed by capture-run data.
-Expected future savings unchanged: ~20–80 ms per `read_context` call
-(200–800-tok bodies on A100), <3% end-to-end per session with ~5 calls.
+Together: a Phase-3.1 prefill-skip for tool-result bodies would need
+to either (a) add SDK surface for mid-stream splice with K
+re-rotation, or (b) turn the register route into something that
+actually matters end-to-end (possibly via a chat-path save-on-export
+re-enablement with scoping + LRU). Neither is load-bearing until we
+know whether the existing layers already cover the workload. That's
+what the Phase-3.0 APC pressure sweep measures.
+
+**Rescoped Phase 3.0:** characterize the baseline. Sweep `N_users ×
+L_tokens × pattern × {baseline|pinned}` synthetic scenarios and
+measure per-round hit rate, TTFT, and the (baseline vs pinned) delta.
+The `tool_result_tokens_imported` field in this divergence is how the
+analyzer distinguishes "APC caught the whole prefix including the
+body" from "APC stopped short at the body's leading block." Decision
+points conditioned on sweep output:
+
+- If baseline hit rate stays ≥ 90 % across realistic pressure →
+  neither the register route nor a prefill-skip fast path adds
+  measurable value for this workload. Phase 2.1 register gets flagged
+  for retirement under task #28's next sync pass; Phase 3.1 scope
+  collapses to documentation.
+- If pinned arm shows a material delta vs baseline under pressure →
+  Phase 2.1 has a real durability story; Phase 3.1 designs an import
+  path that uses the pin. Mechanism TBD from (a)/(b) above.
+- If both arms drop steeply under pressure AND the pinned arm is
+  STRICTLY WORSE (pin steals capacity without offsetting benefit) →
+  Phase 2.1 register is actively harmful; retire immediately.
 
 **Back-compat:** zero by construction — the KV path is unchanged.
-Telemetry field is `Option<u32>` with `skip_serializing_if`, so responses
-to clients that don't know the field are byte-identical to Phase 2.1.
+Telemetry field is `Option<u32>` with `skip_serializing_if`, so
+responses to clients that don't know the field are byte-identical to
+Phase 2.1.
 
-**Upstream-worthy:** conditionally, after the Phase 3.1 prefill-skip
-lands. The detector alone is not useful to pieclaw until the mechanism it
-measures exists. Task #28 revisits at Phase 3.1.
+**Upstream-worthy:** deferred. The detector alone has no obvious
+standalone value for pieclaw; its value is tied to either a
+prefill-skip mechanism (see above) or pressure-benchmark interpretation
+(pie-hermes-specific workload). Task #28 revisits after the sweep
+lands, informed by the retire-or-invest decision.
