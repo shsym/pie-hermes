@@ -296,6 +296,7 @@ dependencies = [
  "llguidance",
  "minijinja",
  "once_cell",
+ "rand_core",
  "serde",
  "serde_json",
  "sha2",

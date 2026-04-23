@@ -141,6 +141,22 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub top_k: Option<u32>,
 
+    /// Min-p truncation. Tokens below `min_p * max_prob` are filtered before
+    /// top-p/top-k. Never in `generation_config.json`; client-only.
+    #[serde(default)]
+    pub min_p: Option<f32>,
+
+    /// OpenAI-style frequency penalty (0.0 = neutral, >0 discourages repeats).
+    /// Never in `generation_config.json`; OpenAI-API-only. F3 wire.
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+
+    /// OpenAI-style presence penalty (0.0 = neutral, >0 discourages tokens
+    /// that already appeared at all). Never in `generation_config.json`;
+    /// OpenAI-API-only. F3 wire.
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+
     /// Tool definitions.
     #[serde(default)]
     pub tools: Option<Vec<Tool>>,
