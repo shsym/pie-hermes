@@ -542,6 +542,11 @@ async fn build_tool_call_sampler(
     Ok(Sampler::Custom {
         temperature,
         sampler: Box::new(sampler),
+        // Penalties are applied upstream by the constrained sampler itself
+        // (see constrained_sampler.rs); pass Default here so the SDK layer
+        // doesn't re-apply them. This field became mandatory in the pie SDK
+        // at 83d1a6ac (unified sampling: gen_config + Penalties — task23).
+        penalties: inferlet::sampler::Penalties::default(),
     })
 }
 
