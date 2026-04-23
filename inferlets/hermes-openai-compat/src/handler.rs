@@ -717,6 +717,7 @@ async fn handle_streaming(
         object: "chat.completion.chunk".to_string(),
         created: 0,
         model: model_name.clone(),
+        pie_cache: None,
         choices: vec![ChunkChoice {
             index: 0,
             delta: ChunkDelta {
@@ -856,6 +857,7 @@ async fn handle_streaming(
                     object: "chat.completion.chunk".to_string(),
                     created: 0,
                     model: model_name.clone(),
+                    pie_cache: None,
                     choices: vec![ChunkChoice {
                         index: 0,
                         delta: ChunkDelta {
@@ -1033,6 +1035,7 @@ async fn handle_streaming(
             object: "chat.completion.chunk".to_string(),
             created: 0,
             model: model_name.clone(),
+            pie_cache: None,
             choices: vec![ChunkChoice {
                 index: 0,
                 delta: ChunkDelta {
@@ -1046,12 +1049,18 @@ async fn handle_streaming(
         emit!(serde_json::to_string(&tc_chunk).unwrap_or_default());
     }
 
-    // Final chunk: finish_reason
+    // Final chunk: finish_reason + pie_cache telemetry.
+    // pie_cache is attached here (not as a separate chunk) so SSE consumers
+    // that serialize chunks into a capture log observe it as a regular data:
+    // event. Mirrors the non-streaming response's top-level pie_cache field.
+    // The earlier ": [PIE-CACHE] …" comment is retained for scraper-based
+    // observers that already rely on it.
     let final_chunk = ChatCompletionChunk {
         id: chunk_id,
         object: "chat.completion.chunk".to_string(),
         created: 0,
         model: model_name,
+        pie_cache: pie_cache.clone(),
         choices: vec![ChunkChoice {
             index: 0,
             delta: ChunkDelta {
