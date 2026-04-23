@@ -505,8 +505,9 @@ async fn build_sampler(
 
 /// Map a `ChatCompletionRequest`'s client-supplied sampling fields into the
 /// SDK's `SamplingOverrides` struct (F2 unified sampling). Any field the
-/// request type doesn't carry (min_p, frequency_penalty, presence_penalty)
-/// is plumbed as `None`; the SDK then falls back to model defaults.
+/// client omits is plumbed as `None`; the SDK then falls back to
+/// generation_config.json defaults (which never carry
+/// `frequency_penalty`/`presence_penalty` — those are OpenAI-API-only).
 fn request_to_sampling_overrides(
     request: &ChatCompletionRequest,
 ) -> inferlet::SamplingOverrides {
@@ -514,10 +515,10 @@ fn request_to_sampling_overrides(
         temperature:        request.temperature,
         top_p:              request.top_p,
         top_k:              request.top_k,
-        min_p:              None,
+        min_p:              request.min_p,
         repetition_penalty: request.repetition_penalty,
-        frequency_penalty:  None,
-        presence_penalty:   None,
+        frequency_penalty:  request.frequency_penalty,
+        presence_penalty:   request.presence_penalty,
     }
 }
 
@@ -2291,8 +2292,8 @@ mod build_sampler_tests {
         assert_eq!(o.top_p, None);
         assert_eq!(o.top_k, None);
         assert_eq!(o.repetition_penalty, None);
-        // Fields absent from ChatCompletionRequest must plumb as None so the
-        // SDK merge falls through to model.generation_defaults().
+        // Absent fields plumb as None so the SDK merge falls through to
+        // model.generation_defaults().
         assert_eq!(o.min_p, None);
         assert_eq!(o.frequency_penalty, None);
         assert_eq!(o.presence_penalty, None);
@@ -2305,6 +2306,9 @@ mod build_sampler_tests {
             top_p: Some(0.95),
             top_k: Some(40),
             repetition_penalty: Some(1.1),
+            min_p: Some(0.05),
+            frequency_penalty: Some(0.5),
+            presence_penalty: Some(0.25),
             ..Default::default()
         };
         let o = request_to_sampling_overrides(&req);
@@ -2312,5 +2316,8 @@ mod build_sampler_tests {
         assert_eq!(o.top_p, Some(0.95));
         assert_eq!(o.top_k, Some(40));
         assert_eq!(o.repetition_penalty, Some(1.1));
+        assert_eq!(o.min_p, Some(0.05));
+        assert_eq!(o.frequency_penalty, Some(0.5));
+        assert_eq!(o.presence_penalty, Some(0.25));
     }
 }
