@@ -45,16 +45,57 @@ class ProbeReport:
 # Capture extraction — pull the assistant messages out of capture.jsonl
 # ---------------------------------------------------------------------------
 
+def _reassemble_streaming_message(chunks: list[dict]) -> dict:
+    """Reassemble a single assistant message from streaming chunks.
+
+    OpenAI streaming sends incremental deltas: `choices[0].delta` carries
+    partial `content` strings and partial `tool_calls` entries indexed by
+    `index`. The final chunk sets `finish_reason`. We rebuild a message
+    that looks like the non-streaming `choices[0].message` shape.
+    """
+    content_parts: list[str] = []
+    # Tool calls accumulate by their `index` field; arguments arrive as
+    # multi-chunk strings that must be concatenated in order.
+    tc_by_idx: dict[int, dict] = {}
+    for c in chunks:
+        choices = c.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta") or {}
+        if delta.get("content"):
+            content_parts.append(delta["content"])
+        for tc in delta.get("tool_calls") or []:
+            idx = tc.get("index", 0)
+            slot = tc_by_idx.setdefault(idx, {"function": {"name": "", "arguments": ""}})
+            fn = tc.get("function") or {}
+            if fn.get("name"):
+                slot["function"]["name"] = fn["name"]
+            if fn.get("arguments"):
+                slot["function"]["arguments"] += fn["arguments"]
+    return {
+        "role": "assistant",
+        "content": "".join(content_parts) if content_parts else None,
+        "tool_calls": [tc_by_idx[i] for i in sorted(tc_by_idx.keys())] or None,
+    }
+
+
 def _iter_assistant_messages(rows: list[dict]) -> list[dict]:
     """Return assistant messages across every chat-completions response in
-    chronological order (one per row)."""
+    chronological order (one per row). Handles both non-streaming
+    (`response.choices[0].message`) and streaming (`chunks` array) captures."""
     msgs: list[dict] = []
     for r in rows:
+        # Non-streaming path
         resp = r.get("response") or {}
         for ch in resp.get("choices", []) or []:
             m = ch.get("message")
             if m and m.get("role") == "assistant":
                 msgs.append(m)
+        # Streaming path: capture stores chunks under `chunks` (or
+        # `stream_chunks` in older builds).
+        chunks = r.get("chunks") or r.get("stream_chunks") or []
+        if chunks:
+            msgs.append(_reassemble_streaming_message(chunks))
     return msgs
 
 
