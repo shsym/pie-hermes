@@ -2081,12 +2081,35 @@ fn save_session_kv_state(
 
     // Versioned export names: the runtime keeps exports as shared read-only
     // resources (import doesn't consume), so each turn must use a unique name.
-    // Old exports accumulate but are harmless — they reference the same
-    // physical pages (a subset of the current turn's pages).  They are
-    // cleaned up when the session is evicted (evict_session releases all).
-    let turn_count = crate::session_cache::load_session_state(session_id)
+    //
+    // Corrigendum — prior comment claimed "old exports accumulate but are
+    // harmless … cleaned up when the session is evicted (evict_session
+    // releases all)." That was wrong: `evict_session` only releases the
+    // CURRENT `state.export_name`, not prior turns'. The prior version of
+    // this code therefore leaked one export name per turn in the engine's
+    // resource registry. Observable symptom: after enough turns, a
+    // re-registration of the same (session_id, turn_count) pair hit
+    // ExportNameExists and the inferlet returned a truncated hyper response
+    // (see 2026-04-24 Phase-3.0 replay sweep FINDINGS).
+    //
+    // Fix: release the prior turn's export BEFORE we create the new one.
+    // This maintains exactly one live export per session at any time. The
+    // ordering (release-then-export, not export-then-release) is chosen for
+    // crash resilience: if we crash between release and export, the stored
+    // SessionKvState still points to the just-released name. The next
+    // load_session_state returns it, `import_kv_pages` finds no pages,
+    // `import_session_kv` returns None, and the request falls through to
+    // `prefix_checkpoint` or `full_prefill` — self-healing. The reverse
+    // order would leave a new export orphaned in the registry on the same
+    // crash window, with no state pointer to find it later.
+    let prior_state = crate::session_cache::load_session_state(session_id);
+    let turn_count = prior_state
+        .as_ref()
         .map(|s| s.turn_count + 1)
         .unwrap_or(1);
+    if let Some(prior) = &prior_state {
+        ctx.queue.release_exported_kv_pages(&prior.export_name);
+    }
 
     let export_name = format!("session-kv:{}:t{}", session_id, turn_count);
 

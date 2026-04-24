@@ -159,6 +159,15 @@ pub fn session_export_name(session_id: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Evict the current session's KV pages (but NOT the prefix checkpoint).
+///
+/// Releases exactly one export (`state.export_name`). This is sufficient
+/// because `handler::save_session_kv_state` enforces the invariant
+/// "at most one live export per session at any time" by releasing the
+/// prior turn's export before creating the new one. Historical versions
+/// of this file (before the 2026-04-24 Phase-3.0 fix) leaked prior-turn
+/// exports; any caller relying on `evict_session` to clean up ALL of a
+/// session's exports should audit that assumption against the current
+/// invariant — see `handler.rs` save_session_kv_state for the contract.
 pub fn evict_session(model: &inferlet::Model) {
     if let Some(state) = load_current_session_state() {
         let queue = model.create_queue();
