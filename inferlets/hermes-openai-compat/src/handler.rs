@@ -329,7 +329,7 @@ pub async fn handle_chat_completions(
         model,
         mut ctx,
         prompt_tokens,
-        pie_cache,
+        mut pie_cache,
         profile: _,
         session_incoming_tokens,
     } = prepared;
@@ -366,7 +366,12 @@ pub async fn handle_chat_completions(
         // produced ExportSync FAILED / PointerNotAllocated errors that hung
         // connections in our c=4/8/16 sweep.  Task #27 Non-goals rule out
         // redesigning the chain-hash scheme, so we validate lookup-only here.
-        save_session_kv_state(&ctx, &request, session_incoming_tokens.as_deref());
+        save_session_kv_state_and_annotate(
+            &ctx,
+            &request,
+            session_incoming_tokens.as_deref(),
+            &mut pie_cache,
+        );
     }
 
     // Parse tool calls from model output
@@ -762,7 +767,7 @@ async fn handle_streaming(
         model,
         mut ctx,
         prompt_tokens: _,
-        pie_cache,
+        mut pie_cache,
         profile: prepare_profile,
         session_incoming_tokens,
     } = prepared;
@@ -1057,6 +1062,19 @@ async fn handle_streaming(
         let _ = body.flush().await;
     }
 
+    // Chat-path save_ctx_blocks intentionally omitted on this experimental
+    // branch (matches the non-streaming path).  Warmup handler populates
+    // block_cache; chat-path re-saves floods the runtime's export registry.
+    //
+    // Run BEFORE the PIE-CACHE comment + final chunk so any
+    // session_kv_save_error tag is visible to both emission paths.
+    save_session_kv_state_and_annotate(
+        &ctx,
+        request,
+        session_incoming_tokens.as_deref(),
+        &mut pie_cache,
+    );
+
     if let Some(pie_cache) = &pie_cache {
         let cache_comment = format!(
             ": [PIE-CACHE] {}\n\n",
@@ -1065,11 +1083,6 @@ async fn handle_streaming(
         let _ = body.write_all(cache_comment.as_bytes()).await;
         let _ = body.flush().await;
     }
-
-    // Chat-path save_ctx_blocks intentionally omitted on this experimental
-    // branch (matches the non-streaming path).  Warmup handler populates
-    // block_cache; chat-path re-saves floods the runtime's export registry.
-    save_session_kv_state(&ctx, request, session_incoming_tokens.as_deref());
 
     // [Phase-B instrumentation] Emit the raw generated text as an SSE
     // comment so the observer can diff pie's model output against vLLM's on
@@ -1284,6 +1297,7 @@ async fn prepare_execution(
             fallback_reason: None,
             ephemeral_tokens_appended: None,
             tool_result_tokens_imported: None,
+            session_kv_save_error: None,
         }),
         profile: PrepareProfile {
             format_chat_ms,
@@ -1378,6 +1392,7 @@ async fn prepare_variant_execution(
             fallback_reason: None,
             ephemeral_tokens_appended: None,
             tool_result_tokens_imported: None,
+            session_kv_save_error: None,
         }),
         profile: PrepareProfile {
             format_chat_ms,
@@ -1498,6 +1513,7 @@ async fn prepare_session_execution(
                         fallback_reason: None,
                         ephemeral_tokens_appended: None,
                         tool_result_tokens_imported: None,
+                        session_kv_save_error: None,
                     }),
                     profile: PrepareProfile {
                         format_chat_ms,
@@ -1557,6 +1573,7 @@ async fn prepare_session_execution(
                         fallback_reason: None,
                         ephemeral_tokens_appended: None,
                         tool_result_tokens_imported: None,
+                        session_kv_save_error: None,
                     }),
                     profile: PrepareProfile {
                         format_chat_ms,
@@ -1623,6 +1640,7 @@ async fn prepare_session_execution(
                         fallback_reason: Some("block_cache_hit".to_string()),
                         ephemeral_tokens_appended: None,
                         tool_result_tokens_imported: None,
+                        session_kv_save_error: None,
                     }),
                     profile: PrepareProfile {
                         format_chat_ms,
@@ -1672,6 +1690,7 @@ async fn prepare_session_execution(
             fallback_reason: Some("full_prefill".to_string()),
             ephemeral_tokens_appended: None,
             tool_result_tokens_imported: None,
+            session_kv_save_error: None,
         }),
         profile: PrepareProfile {
             format_chat_ms,
@@ -1728,6 +1747,7 @@ async fn prepare_structured_execution(
                     fallback_reason: None,
                     ephemeral_tokens_appended: None,
                     tool_result_tokens_imported: None,
+                    session_kv_save_error: None,
                 }),
             )
             .await;
@@ -1761,6 +1781,7 @@ async fn prepare_structured_execution(
                         fallback_reason: None,
                         ephemeral_tokens_appended: None,
                         tool_result_tokens_imported: None,
+                        session_kv_save_error: None,
                     }),
                 )
                 .await;
@@ -1796,6 +1817,7 @@ async fn prepare_structured_execution(
                         fallback_reason: None,
                         ephemeral_tokens_appended: None,
                         tool_result_tokens_imported: None,
+                        session_kv_save_error: None,
                     }),
                 )
                 .await;
@@ -1858,6 +1880,7 @@ async fn prepare_structured_execution(
                     fallback_reason: None,
                     ephemeral_tokens_appended: None,
                     tool_result_tokens_imported: None,
+                    session_kv_save_error: None,
                 }),
             )
             .await;
@@ -1891,6 +1914,7 @@ async fn prepare_structured_execution(
                             fallback_reason: None,
                             ephemeral_tokens_appended: None,
                             tool_result_tokens_imported: None,
+                            session_kv_save_error: None,
                         }),
                     )
                     .await;
@@ -1968,6 +1992,7 @@ async fn prepare_structured_execution(
             fallback_reason: None,
             ephemeral_tokens_appended: None,
             tool_result_tokens_imported: None,
+            session_kv_save_error: None,
         }),
         profile: PrepareProfile {
             format_chat_ms: validate_prefix_ms + format_chat_tail_ms,
@@ -2099,25 +2124,34 @@ fn first_token_mismatch(left: &[u32], right: &[u32]) -> Option<u32> {
 /// `incoming_tokens` is the format_chat output for THIS turn's input messages —
 /// it's what the next turn will compare against (not ctx.get_token_ids() which
 /// includes generated tokens that don't round-trip through format_chat).
+/// Return value:
+/// * `Ok(true)`  — attempted and succeeded.
+/// * `Ok(false)` — no attempt (no `pie_session`, no incoming tokens, or
+///                 empty ctx). Not an error condition.
+/// * `Err(tag)`  — attempted and the engine rejected the export. The tag
+///                 is a short stable string suitable for surfacing in
+///                 `PieCacheTelemetry::session_kv_save_error` so a rising
+///                 failure rate is observable without an eprintln (which
+///                 wedges the response under wstd — see task #47).
 fn save_session_kv_state(
     ctx: &inferlet::Context,
     request: &ChatCompletionRequest,
     incoming_tokens: Option<&[u32]>,
-) {
+) -> Result<bool, &'static str> {
     let pie_session = match &request.pie_session {
         Some(s) => s,
-        None => return,
+        None => return Ok(false),
     };
     let incoming = match incoming_tokens {
         Some(t) => t,
-        None => return,
+        None => return Ok(false),
     };
 
     let session_id = &pie_session.session_id;
     let kv_page_last_len = ctx.get_kv_page_last_len();
 
     if ctx.kv_pages.is_empty() {
-        return;
+        return Ok(false);
     }
 
     // Versioned export names: the runtime keeps exports as shared read-only
@@ -2158,13 +2192,14 @@ fn save_session_kv_state(
     // count accounting edge case removed a ptr from the instance's allocated
     // set between import and export, or an ExportNameExists collision with a
     // concurrent request sharing the same session_id), skip save_session_state
-    // silently. NO eprintln! here — we are executing inside a sync helper
-    // called from an async-executed handler, and on wasm32-wasip2/wstd a
-    // sync stderr write from this context wedges the request's HTTP response
-    // (see test_no_sync_eprintln.rs; task #47 N≥8 IncompleteMessage repro
-    // pinned the wedge here).
+    // but surface a tag via the returned Err so the async caller can annotate
+    // `pie_cache.session_kv_save_error`. NO eprintln! here — we are executing
+    // inside a sync helper called from an async-executed handler, and on
+    // wasm32-wasip2/wstd a sync stderr write from this context wedges the
+    // request's HTTP response (see test_no_sync_eprintln.rs; task #47 N≥8
+    // IncompleteMessage repro pinned the wedge here).
     if ctx.queue.export_kv_pages_sync(&ctx.kv_pages, &export_name).is_err() {
-        return;
+        return Err("export_kv_pages_sync_err");
     }
 
     let reordered = crate::prompt_render::reorder_system_sections(&request.messages);
@@ -2179,6 +2214,26 @@ fn save_session_kv_state(
         prefix_checkpoint_hash: system_hash,
     };
     crate::session_cache::save_session_state(&state);
+    Ok(true)
+}
+
+/// Run `save_session_kv_state` and annotate the request's `pie_cache`
+/// telemetry with any error tag. Keeps the call sites terse: the two
+/// handler paths (non-streaming, streaming) each call this once.
+fn save_session_kv_state_and_annotate(
+    ctx: &inferlet::Context,
+    request: &ChatCompletionRequest,
+    incoming_tokens: Option<&[u32]>,
+    pie_cache: &mut Option<PieCacheTelemetry>,
+) {
+    match save_session_kv_state(ctx, request, incoming_tokens) {
+        Ok(_) => {}
+        Err(tag) => {
+            if let Some(cache) = pie_cache.as_mut() {
+                cache.session_kv_save_error = Some(tag.to_string());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
