@@ -451,6 +451,18 @@ pub struct PieCacheTelemetry {
     /// tool message is slightly larger than the reported value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_result_tokens_imported: Option<u32>,
+    /// Short tag describing why `save_session_kv_state` bailed out on its
+    /// error path. `None` when the save path was not attempted (no
+    /// `pie_session`, no incoming tokens, empty ctx) OR when it succeeded.
+    /// `Some("export_kv_pages_sync_err")` when the engine rejected the
+    /// ptrs list; clients can alert on a non-zero rate of this value.
+    ///
+    /// This replaces the `eprintln!` that wedged N>=8 concurrency (task #47)
+    /// — the write had to leave the sync helper, but we still want the
+    /// failure observable, so we plumb a tag through telemetry instead of
+    /// swallowing the error silently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_kv_save_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -48,7 +48,15 @@ test-*.log
 test-logs/
 
 # --- Capture runs are reproducible artifacts — don't commit them. ---
+# Two locations: repo-root `captures/` (legacy) and `bench/captures/` (the
+# current driver writes here — task #47's bench/mempressure.py + task #48's
+# bench/correctness_high_c.py both land under bench/captures/runs/).
 captures/runs/*
+bench/captures/
+
+# --- Ad-hoc investigation logs (REPORT.md, probe outputs, raw .log files). ---
+# Same rationale as /docs/ below — local-only scratch, per CLAUDE.md.
+/logs/
 
 # --- Plans / working docs — local only (CLAUDE.md: "don't commit docs"). ---
 # Scoped to repo-root /docs/ so nested `docs/` dirs inside submodules or

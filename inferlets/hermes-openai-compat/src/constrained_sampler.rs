@@ -482,6 +482,14 @@ impl Sample for ConstrainedSampler {
             // token in the full-vocab grammar mask (same behavior as the
             // pre-refactor code).
             res.first_bit_set().unwrap_or(inner.eos_token_id as usize) as u32
+        } else if dist.len() == 1 {
+            // Singleton short-circuit: skip the RNG draw so the stream
+            // stays bit-for-bit identical to the pre-SDK-refactor sampler
+            // (which had the same fast path). Without this, every forced
+            // token consumes one xorshift64* advance and the observable
+            // sequence under a fixed seed silently shifts relative to
+            // pre-refactor captures.
+            dist[0].0
         } else {
             weighted_sample(&dist, &mut inner.rng)
         };

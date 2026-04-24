@@ -27,6 +27,30 @@ if [[ "${1:-}" == "--debug" ]]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Guard: the block_cache lookup path relies on the `IMPORTED-CTX` branch
+# in pie-vllm's `vllm_sequence_tracker.py` overlay (pie-vllm commit
+# 9118d46a, 2026-04-11). Without it, cross-session KV imports corrupt
+# responses via the sibling-walk path the tracker historically took —
+# see block_cache.rs "Historical" section. Refuse to build if the pinned
+# pie-vllm submodule does not contain that commit as an ancestor, so a
+# future submodule bump that accidentally drops the fix fails loudly at
+# build time rather than silently reintroducing cross-request
+# contamination in production.
+PIE_VLLM="$REPO_ROOT/pie-vllm"
+REQUIRED_PIE_VLLM_COMMIT="9118d46a"
+if [[ -d "$PIE_VLLM/.git" || -f "$PIE_VLLM/.git" ]]; then
+  if ! git -C "$PIE_VLLM" merge-base --is-ancestor "$REQUIRED_PIE_VLLM_COMMIT" HEAD 2>/dev/null; then
+    echo "error: pinned pie-vllm submodule does not contain $REQUIRED_PIE_VLLM_COMMIT" >&2
+    echo "       ($REQUIRED_PIE_VLLM_COMMIT is the IMPORTED-CTX tracker fix required by block_cache.rs)" >&2
+    echo "       bump the pie-vllm submodule or disable block_cache lookup before building." >&2
+    exit 4
+  fi
+else
+  echo "warning: pie-vllm submodule not initialized; skipping IMPORTED-CTX ancestor check." >&2
+  echo "         run: git submodule update --init --recursive" >&2
+fi
+
 cd "$REPO_ROOT/inferlets/hermes-openai-compat"
 
 # Fail fast with a helpful message when the target isn't installed.
