@@ -46,12 +46,16 @@ pub fn sha256_hex(input: &str) -> String {
 
 /// Hash only the stable prefix of a reordered system prompt.
 ///
-/// After `reorder_system_sections`, dynamic sections (## Messaging,
-/// ## Reactions, ## Runtime) sit at the end of the system message.
-/// This function hashes everything *before* the first dynamic section,
-/// so cross-channel sessions (e.g. Telegram vs Discord) that share the
-/// same stable prefix will produce the same hash — enabling checkpoint
-/// sharing even when their dynamic sections differ.
+/// After `reorder_system_sections`, the dynamic `## Current Session Context`
+/// section (carrying per-user user_name / chat_id / channel metadata emitted
+/// by hermes-agent's `build_session_context_prompt`) sits at the end of the
+/// system message. This function hashes everything *before* the first
+/// dynamic header, so different users on the same bearer produce the same
+/// stable-prefix hash — enabling prefix_checkpoint sharing across users
+/// even when their per-session context differs.
+///
+/// Keep the marker list in sync with `DYNAMIC_SECTIONS` in
+/// `prompt_render.rs`.
 ///
 /// Callers must pass messages that have already been reordered.
 pub fn hash_reordered_stable_prefix(messages: &[crate::types::ChatMessage]) -> String {
@@ -61,7 +65,7 @@ pub fn hash_reordered_stable_prefix(messages: &[crate::types::ChatMessage]) -> S
         .map(|m| m.content.as_str())
         .unwrap_or("");
 
-    let dynamic_headers = ["\n## Messaging", "\n## Reactions", "\n## Runtime"];
+    let dynamic_headers = ["\n## Current Session Context"];
     let cutoff = dynamic_headers
         .iter()
         .filter_map(|dh| system_content.find(dh))
@@ -276,4 +280,52 @@ pub fn import_prefix_checkpoint(
         checkpoint.token_ids.clone(),
         truncated_last_len,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ChatMessage;
+
+    fn sys(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "system".to_string(),
+            content: content.to_string(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn stable_prefix_hash_identical_when_only_session_context_differs() {
+        // Same static persona, different per-user Current Session Context
+        // blocks — stable-prefix hash must match so prefix_checkpoint is
+        // reusable across users on one bearer.
+        let alice = sys("static persona\n## Current Session Context\nuser=alice chat=general");
+        let bob = sys("static persona\n## Current Session Context\nuser=bob chat=dm");
+        assert_eq!(
+            hash_reordered_stable_prefix(&[alice]),
+            hash_reordered_stable_prefix(&[bob])
+        );
+    }
+
+    #[test]
+    fn stable_prefix_hash_differs_when_static_persona_differs() {
+        let a = sys("persona A\n## Current Session Context\nuser=alice");
+        let b = sys("persona B\n## Current Session Context\nuser=alice");
+        assert_ne!(
+            hash_reordered_stable_prefix(&[a]),
+            hash_reordered_stable_prefix(&[b])
+        );
+    }
+
+    #[test]
+    fn stable_prefix_hash_falls_back_to_full_content_when_no_marker() {
+        // If the caller never emitted `## Current Session Context` (e.g.
+        // CLI-mode hermes-agent traffic), the whole content is hashed.
+        let c = sys("static persona only, no session context section");
+        let expected = sha256_hex("static persona only, no session context section");
+        assert_eq!(hash_reordered_stable_prefix(&[c]), expected);
+    }
 }

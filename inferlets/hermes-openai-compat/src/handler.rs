@@ -1358,12 +1358,13 @@ async fn prepare_session_execution(
     let t_start = std::time::Instant::now();
     let session_id = &request.pie_session.as_ref().unwrap().session_id;
 
-    // Reorder dynamic system sections (## Messaging/## Reactions/## Runtime) to
-    // the end before tokenization. This is required for the prefix checkpoint
-    // path to work across channels: the checkpoint stores tokens of the
-    // reordered stable prefix, and incoming tokens must use the same ordering
-    // so `find_prefix_match_len` sees an aligned prefix.  Session KV (Level 1)
-    // also uses the reordered form for consistency.
+    // Reorder dynamic system sections (## Current Session Context) to the
+    // end before tokenization. Required for the prefix checkpoint path to
+    // work across users on the same bearer: the checkpoint stores tokens
+    // of the reordered stable prefix, and incoming tokens must use the
+    // same ordering so `find_prefix_match_len` sees an aligned prefix.
+    // Session KV (Level 1) also uses the reordered form for consistency.
+    // See `prompt_render::DYNAMIC_SECTIONS` for the marker list.
     let reordered_messages = crate::prompt_render::reorder_system_sections(&request.messages);
 
     // Tokenize WITHOUT generation prompt (one call instead of two).
