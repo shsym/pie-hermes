@@ -283,6 +283,22 @@ re-supplying the hash per-call.
 named prefix and intercept a tool call to import it" pattern is generic;
 the specific naming scheme is pie-hermes business. Task #28 decides.
 
+**Status note (2026-04-24, Phase 3.0 measurement):** the two Phase 3.0
+capture-run sweeps confirmed that the handles registered by this route
+are unconsumed on the chat path. No code path in `prepare_execution`,
+`prepare_session_execution`, `prepare_structured_execution`, or
+`prepare_variant_execution` looks up the `hermes-section-*` namespace,
+and the sweeps measured 0 % cache hits on every synthetic baseline arm.
+The route still runs correctly and the boot-time registrar succeeds;
+the exported KV pages pin a small amount of capacity (≈2–5k tokens for
+a typical hermes-agent section set, < 5 % of observed `kv_avail` on an
+80 GB A100) but have no observable effect on throughput. Consumer
+deferred to Phase 3.1+ pending a design that survives the RoPE
+positional-encoding constraint noted in divergence #8. See
+`captures/runs/2026-04-23T20-51-20_*_phase-3.0-initial/FINDINGS.md`
+(synthetic) and `captures/runs/2026-04-23T22-49-22_*_phase-3.0-replay-
+sessions/FINDINGS.md` (replay).
+
 ### 8. Tool-result body → registered-handle detection + telemetry (Task 3.0)
 
 **Added:** 2026-04-23, Phase 3.0 (pie-hermes).
