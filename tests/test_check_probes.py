@@ -203,6 +203,101 @@ def test_missing_capture_file_fails(tmp_path):
 
 
 # -----------------------------------------------------------------------------
+# Phase-3.0 must_import_kv — detect registered-handle match on role:"tool"
+# bodies via pie_cache.tool_result_tokens_imported. The probe must pass
+# whether telemetry rides the non-streaming response top-level field or the
+# final streaming chunk's field (Phase 2.1 / Phase 3.0 wire parity).
+# -----------------------------------------------------------------------------
+
+def _capture_row_with_pie_cache(pie_cache: dict, *, streaming: bool = False) -> dict:
+    """Capture row that carries `pie_cache` on either the response body
+    (non-streaming) or the final chunk (streaming). Mirrors the inferlet's
+    emission pattern — see src/handler.rs:1084-1095."""
+    if streaming:
+        return {
+            "kwargs": {"messages": [], "tools": []},
+            "chunks": [
+                {"choices": [{"index": 0, "delta": {"content": "hc_"}}]},
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                 "pie_cache": pie_cache},
+            ],
+        }
+    return {
+        "kwargs": {"messages": [], "tools": []},
+        "response": {
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hc_"},
+                "finish_reason": "stop",
+            }],
+            "pie_cache": pie_cache,
+        },
+    }
+
+
+def test_must_import_kv_passes_on_nonstreaming_response(tmp_path):
+    cap = tmp_path / "capture.jsonl"
+    _write_capture(cap, [_capture_row_with_pie_cache(
+        {"mode": "direct", "tool_result_tokens_imported": 42}
+    )])
+    r = check_probe("p", cap, {"must_import_kv": {"min_tokens": 1}})
+    assert r.passed, r.failures
+
+
+def test_must_import_kv_passes_on_streaming_final_chunk(tmp_path):
+    cap = tmp_path / "capture.jsonl"
+    _write_capture(cap, [_capture_row_with_pie_cache(
+        {"mode": "direct", "tool_result_tokens_imported": 42},
+        streaming=True,
+    )])
+    r = check_probe("p", cap, {"must_import_kv": {"min_tokens": 1}})
+    assert r.passed, r.failures
+
+
+def test_must_import_kv_fails_when_field_absent(tmp_path):
+    """Pre-Phase-3.0 inferlet build: pie_cache present but without the new
+    field. Analyzer must fail loudly so probe-red is visible."""
+    cap = tmp_path / "capture.jsonl"
+    _write_capture(cap, [_capture_row_with_pie_cache({"mode": "direct"})])
+    r = check_probe("p", cap, {"must_import_kv": {"min_tokens": 1}})
+    assert not r.passed
+    assert any("tool_result_tokens_imported" in f for f in r.failures)
+
+
+def test_must_import_kv_fails_when_below_min_tokens(tmp_path):
+    cap = tmp_path / "capture.jsonl"
+    _write_capture(cap, [_capture_row_with_pie_cache(
+        {"mode": "direct", "tool_result_tokens_imported": 0}
+    )])
+    r = check_probe("p", cap, {"must_import_kv": {"min_tokens": 1}})
+    assert not r.passed
+    assert any("min_tokens" in f for f in r.failures)
+
+
+def test_must_import_kv_fails_when_no_pie_cache_at_all(tmp_path):
+    """Capture hook wrote rows but no telemetry anywhere — mis-configured
+    build. Surface it so we don't silently pass."""
+    cap = tmp_path / "capture.jsonl"
+    _write_capture(cap, [_capture_row("hc_")])
+    r = check_probe("p", cap, {"must_import_kv": {"min_tokens": 1}})
+    assert not r.passed
+    assert any("no pie_cache telemetry" in f for f in r.failures)
+
+
+def test_must_import_kv_uses_max_across_turns(tmp_path):
+    """Multi-turn probes emit one pie_cache per chat-completion; only one of
+    the turns (the post-tool-call turn) carries a body that matches a
+    registered handle. The probe passes when ANY turn sees a match."""
+    cap = tmp_path / "capture.jsonl"
+    _write_capture(cap, [
+        _capture_row_with_pie_cache({"mode": "direct", "tool_result_tokens_imported": 0}),
+        _capture_row_with_pie_cache({"mode": "session_kv", "tool_result_tokens_imported": 88}),
+    ])
+    r = check_probe("p", cap, {"must_import_kv": {"min_tokens": 1}})
+    assert r.passed, r.failures
+
+
+# -----------------------------------------------------------------------------
 # check_run cross-run integration
 # -----------------------------------------------------------------------------
 

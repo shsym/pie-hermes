@@ -31,6 +31,14 @@ Thumbs.db
 
 # --- Local pie endpoint override (contains the live pod URL) ---
 configs/cli-config.pie.local.yaml
+# Per-run derived config variants (sed'd from base templates at invocation time).
+configs/cli-config.*.local.yaml
+configs/cli-config.qwen35.fp8.yaml
+configs/cli-config.qwen35.9b.yaml
+
+# --- Experimental / research logs (per CLAUDE.md: don't commit docs). ---
+# Contains per-task REPORTs, raw pod logs, one-off probe scripts.
+/logs/
 
 # --- Scratch space used by scripts/run_in_container.sh ---
 bench/_tmp/
