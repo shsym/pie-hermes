@@ -158,6 +158,63 @@ pub async fn handle_chat_prefix_warm(body_bytes: Vec<u8>, responder: Responder) 
     responder.respond(http_response).await
 }
 
+/// POST /v1/pie/block-cache/config
+///
+/// Sets the block_cache LRU budget (max total pinned KV pages across
+/// all exports).  Body: `{"budget_pages": <u64 or null>}`.  Null clears
+/// the budget — unbounded growth (original shipping behavior).
+///
+/// Used by the memory-pressure benchmark (task #47) to sweep B per arm.
+pub async fn handle_block_cache_config(
+    body_bytes: Vec<u8>,
+    responder: Responder,
+) -> Finished {
+    #[derive(serde::Deserialize)]
+    struct ConfigBody {
+        budget_pages: Option<usize>,
+    }
+    let body: ConfigBody = match serde_json::from_slice(&body_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            return crate::error_response(responder, 400, &format!("Invalid JSON: {}", e)).await;
+        }
+    };
+    crate::block_cache::set_budget(body.budget_pages);
+    let status = crate::block_cache::status();
+    let resp_json = match serde_json::to_string(&status) {
+        Ok(s) => s,
+        Err(e) => {
+            return crate::error_response(responder, 500, &format!("status serialize: {}", e)).await;
+        }
+    };
+    let http_response = Response::builder()
+        .header("Content-Type", "application/json")
+        .body(resp_json.into_body())
+        .unwrap();
+    responder.respond(http_response).await
+}
+
+/// GET /v1/pie/block-cache/status
+///
+/// Returns the current LRU index summary: budget, number of pinned
+/// exports, total pinned pages, access counter.  Used by the benchmark
+/// driver to verify eviction fired and by the accuracy probe (§6.3)
+/// to confirm pinned pages are < budget after each arm.
+pub async fn handle_block_cache_status(responder: Responder) -> Finished {
+    let status = crate::block_cache::status();
+    let resp_json = match serde_json::to_string(&status) {
+        Ok(s) => s,
+        Err(e) => {
+            return crate::error_response(responder, 500, &format!("status serialize: {}", e)).await;
+        }
+    };
+    let http_response = Response::builder()
+        .header("Content-Type", "application/json")
+        .body(resp_json.into_body())
+        .unwrap();
+    responder.respond(http_response).await
+}
+
 /// Handle POST /v1/chat/completions.
 pub async fn handle_chat_completions(
     body_bytes: Vec<u8>,
@@ -1531,6 +1588,9 @@ async fn prepare_session_execution(
                 &incoming_tokens,
                 page_size,
             ) {
+                // Touch LRU so this hot prefix is protected from eviction
+                // on the next warmup save under a tight budget.
+                crate::block_cache::touch(&export_name);
                 let import_ms = t_import.elapsed().as_secs_f64() * 1000.0;
                 let tail = incoming_tokens[matched_tokens..].to_vec();
                 let tail_len = tail.len() as u32;

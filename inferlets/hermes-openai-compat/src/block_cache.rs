@@ -94,10 +94,22 @@
 //! 3. The caller imports `export_name`, truncates the pages to the
 //!    first `pages` entries, and builds a Context.
 //!
+//! ## LRU eviction
+//!
+//! A single JSON index at `bc:lru:index` tracks every live export with
+//! `(name, pages, access_counter)`. `save_ctx_blocks` upserts after
+//! export; `touch` bumps on lookup-hit. When total pinned pages exceed
+//! `bc:config:budget_pages` (default: unbounded), the oldest-access
+//! entry is popped and its backing export released via
+//! `queue.release_exported_kv_pages`. Lookup entries pointing at a
+//! released export are purged from `bc:blk:*` during the same pass.
+//!
+//! Budget is set per request via a `?budget=<pages>` query param on the
+//! warmup endpoint — this is the knob the memory-pressure benchmark
+//! sweeps. Absence of the key = no eviction (original unbounded behavior).
+//!
 //! ## Constraints
 //!
-//! - Storage is unbounded in this initial implementation.  Add LRU
-//!   eviction before production.
 //! - The same physical KV page may be referenced by multiple lookup
 //!   entries from different requests.  Releasing any one of those
 //!   entries must not release the underlying pages as long as another
@@ -111,6 +123,168 @@ use sha2::{Digest, Sha256};
 struct LookupEntry {
     req: String,
     pages: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LruIndex {
+    pub entries: Vec<LruEntry>,
+    pub counter: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LruEntry {
+    pub name: String,
+    pub pages: usize,
+    pub access: u64,
+}
+
+/// Pure LRU upsert + eviction.  Does NOT touch the inferlet store or
+/// any queue — returns the list of export names the caller must release.
+/// Split out from the store-coupled wrapper so unit tests can exercise
+/// ordering without the SDK.
+pub fn lru_upsert_evict(
+    idx: &mut LruIndex,
+    name: &str,
+    pages: usize,
+    budget: usize,
+) -> Vec<String> {
+    idx.counter = idx.counter.saturating_add(1);
+    let access = idx.counter;
+
+    let existing_pos = idx.entries.iter().position(|e| e.name == name);
+    match existing_pos {
+        Some(i) => {
+            idx.entries[i].access = access;
+            idx.entries[i].pages = pages;
+        }
+        None => idx.entries.push(LruEntry {
+            name: name.to_string(),
+            pages,
+            access,
+        }),
+    }
+    idx.entries.sort_by_key(|e| e.access);
+
+    let mut evicted: Vec<String> = Vec::new();
+    while idx.entries.len() > 1 {
+        let total: usize = idx.entries.iter().map(|e| e.pages).sum();
+        if total <= budget {
+            break;
+        }
+        let oldest = idx.entries.remove(0);
+        if oldest.name == name {
+            idx.entries.insert(0, oldest);
+            break;
+        }
+        evicted.push(oldest.name);
+    }
+    evicted
+}
+
+/// Pure touch (bump access) of an existing entry.  No-op if missing.
+pub fn lru_touch(idx: &mut LruIndex, name: &str) {
+    if let Some(i) = idx.entries.iter().position(|e| e.name == name) {
+        idx.counter = idx.counter.saturating_add(1);
+        idx.entries[i].access = idx.counter;
+        idx.entries.sort_by_key(|e| e.access);
+    }
+}
+
+const LRU_INDEX_KEY: &str = "bc:lru:index";
+const BUDGET_KEY: &str = "bc:config:budget_pages";
+
+fn load_index() -> LruIndex {
+    inferlet::store_get(LRU_INDEX_KEY)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_index(idx: &LruIndex) {
+    if let Ok(s) = serde_json::to_string(idx) {
+        inferlet::store_set(LRU_INDEX_KEY, &s);
+    }
+}
+
+/// Read the configured budget (max pinned KV pages across all exports).
+/// Returns `usize::MAX` when unset = no eviction.
+pub fn configured_budget() -> usize {
+    inferlet::store_get(BUDGET_KEY)
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(usize::MAX)
+}
+
+/// Set the budget (pages). Called by the warmup handler when ?budget=<n>
+/// is present. Pass `None` to clear (restore unbounded behavior).
+pub fn set_budget(pages: Option<usize>) {
+    match pages {
+        Some(n) => inferlet::store_set(BUDGET_KEY, &n.to_string()),
+        None => inferlet::store_delete(BUDGET_KEY),
+    }
+}
+
+/// Bump access counter for an existing LRU entry.  Called from handler
+/// after a successful `import_prefix` on the chat path so hot prefixes
+/// are preserved under eviction pressure.  No-op if `name` is not in the
+/// index (stale lookup entry pointing at a released export).
+pub fn touch(name: &str) {
+    let mut idx = load_index();
+    let before_counter = idx.counter;
+    lru_touch(&mut idx, name);
+    if idx.counter != before_counter {
+        save_index(&idx);
+    }
+}
+
+/// Store-coupled wrapper around `lru_upsert_evict`.  Loads the index,
+/// applies the upsert with the configured budget, writes it back, and
+/// returns the list of export names the caller must release.
+fn record_save_and_collect_evictions(name: &str, pages: usize) -> Vec<String> {
+    let mut idx = load_index();
+    let evicted = lru_upsert_evict(&mut idx, name, pages, configured_budget());
+    save_index(&idx);
+    evicted
+}
+
+/// Summary of the current LRU state — for /v1/pie/block-cache/status
+/// introspection and test assertions.
+#[derive(Debug, Clone, Serialize)]
+pub struct LruStatus {
+    pub budget_pages: Option<usize>,
+    pub num_exports: usize,
+    pub total_pinned_pages: usize,
+    pub counter: u64,
+}
+
+pub fn status() -> LruStatus {
+    let idx = load_index();
+    let total: usize = idx.entries.iter().map(|e| e.pages).sum();
+    let budget = inferlet::store_get(BUDGET_KEY)
+        .and_then(|s| s.trim().parse::<usize>().ok());
+    LruStatus {
+        budget_pages: budget,
+        num_exports: idx.entries.len(),
+        total_pinned_pages: total,
+        counter: idx.counter,
+    }
+}
+
+/// Remove all `bc:blk:*` lookup entries that reference a released
+/// export. O(total lookup entries) per eviction — amortized over many
+/// saves. Safe to call after release because stale entries would only
+/// produce import-time misses, but cleaning keeps lookup fast.
+fn purge_lookup_entries_pointing_at(released_name: &str) {
+    for key in inferlet::store_list_keys() {
+        if !key.starts_with("bc:blk:") {
+            continue;
+        }
+        if let Some(json) = inferlet::store_get(&key) {
+            if let Ok(entry) = serde_json::from_str::<LookupEntry>(&json) {
+                if entry.req == released_name {
+                    inferlet::store_delete(&key);
+                }
+            }
+        }
+    }
 }
 
 /// 32-byte chain hash.  `prev` is the hash of the previous block (zero-filled
@@ -257,6 +431,16 @@ pub fn save_ctx_blocks(
             inferlet::store_set(&key, &json);
             wrote_any = true;
         }
+    }
+
+    // Register in LRU index (upsert + access bump) and release any
+    // entries that push us over the configured budget.  `ctx.kv_pages.len()`
+    // is the pinned-page count because we exported the full Vec above.
+    let pinned_pages = ctx.kv_pages.len();
+    let evicted = record_save_and_collect_evictions(&name, pinned_pages);
+    for evicted_name in &evicted {
+        ctx.queue.release_exported_kv_pages(evicted_name);
+        purge_lookup_entries_pointing_at(evicted_name);
     }
 
     wrote_any
