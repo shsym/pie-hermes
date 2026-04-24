@@ -16,6 +16,11 @@ Schema of an expectation entry (see bench/driver.py:PROBE_EXPECTATIONS):
                                   partial-args dict] each named tool must have
                                          been called with at least the named
                                          keys/values in args (partial match)
+    must_import_kv           dict      at least one captured pie_cache.
+                                         tool_result_tokens_imported value
+                                         must be >= min_tokens. Phase-3.0
+                                         detection gate (VENDOR_SOURCE #8).
+                                         Shape: {"min_tokens": int}.
 
 Usage:
     python -m bench.check_probes captures/runs/<RUN_ID>           # exit 0 = all pass
@@ -200,6 +205,62 @@ def _check_must_call_tool_with_args(
     return failures
 
 
+def _iter_pie_cache_entries(rows: list[dict]) -> list[dict]:
+    """Return every `pie_cache` telemetry object observed in the capture.
+
+    Two wire shapes emit telemetry:
+      - Non-streaming: `response.pie_cache` (top-level field on the chat
+        completion response).
+      - Streaming: the final SSE chunk carries `pie_cache` alongside
+        `finish_reason`. The capture hook stores all chunks under `chunks`
+        (or `stream_chunks` on older builds); we scan each chunk.
+
+    We collect ALL occurrences so a multi-turn probe (one chat-completion
+    per turn) can be inspected across turns.
+    """
+    out: list[dict] = []
+    for r in rows:
+        resp = r.get("response") or {}
+        pc = resp.get("pie_cache")
+        if isinstance(pc, dict):
+            out.append(pc)
+        for ch in r.get("chunks") or r.get("stream_chunks") or []:
+            pc = ch.get("pie_cache")
+            if isinstance(pc, dict):
+                out.append(pc)
+    return out
+
+
+def _check_must_import_kv(rows: list[dict], spec: dict[str, Any]) -> list[str]:
+    min_tokens = spec.get("min_tokens", 1)
+    entries = _iter_pie_cache_entries(rows)
+    if not entries:
+        return [
+            "must_import_kv: no pie_cache telemetry observed in capture "
+            "(inferlet build predates Phase 3.0 telemetry wiring, or the "
+            "capture hook did not record chunks/response fields)"
+        ]
+    observed = [
+        e.get("tool_result_tokens_imported")
+        for e in entries
+        if e.get("tool_result_tokens_imported") is not None
+    ]
+    if not observed:
+        return [
+            "must_import_kv: pie_cache present but tool_result_tokens_imported "
+            "field is absent on every entry (Phase-3.0 telemetry not populated; "
+            "see VENDOR_SOURCE.md #8)"
+        ]
+    best = max(int(v) for v in observed)
+    if best < min_tokens:
+        return [
+            f"must_import_kv: max tool_result_tokens_imported={best} "
+            f"< min_tokens={min_tokens}; inferlet did not detect a matching "
+            "context_section handle for any inbound role:\"tool\" body"
+        ]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -210,6 +271,7 @@ _SUPPORTED_KEYS = {
     "must_call_tool",
     "must_not_call_tool",
     "must_call_tool_with_args",
+    "must_import_kv",
 }
 
 
@@ -236,6 +298,8 @@ def check_probe(slug: str, capture_path: Path, expectation: dict[str, Any]) -> P
     failures += _check_must_call_tool_with_args(
         calls, expectation.get("must_call_tool_with_args") or {}
     )
+    if "must_import_kv" in expectation:
+        failures += _check_must_import_kv(rows, expectation["must_import_kv"])
 
     return ProbeReport(slug=slug, passed=not failures, failures=failures)
 

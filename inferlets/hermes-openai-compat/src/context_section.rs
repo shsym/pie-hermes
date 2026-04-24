@@ -17,10 +17,13 @@
 //!
 //! Local divergence from upstream pieclaw — see VENDOR_SOURCE.md #7.
 
-use inferlet::{Context, Resource};
+use inferlet::{Context, Model, Resource};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Response};
+
+use crate::types::ChatMessage;
 
 /// Max accepted size of `body_text` in bytes. A context section represents a
 /// chunk of a human-authored file (AGENTS.md and friends); 1 MiB is ~2x the
@@ -246,6 +249,95 @@ pub async fn handle_register(body_bytes: Vec<u8>, responder: Responder) -> Finis
     responder.respond(http).await
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3.0 — tool-result body hashing + registered-handle lookup.
+//
+// On every inbound chat request we scan `role:"tool"` messages for content
+// that matches a body registered via `/v1/pie/context-section/register`
+// (VENDOR_SOURCE.md #7). On match we count the body tokens and surface the
+// total in `pie_cache.tool_result_tokens_imported` (VENDOR_SOURCE.md #8).
+//
+// Phase 3.0 is DETECTION + TELEMETRY only. Actual prefill-skip requires
+// mid-stream KV-splice with RoPE re-rotation, which the SDK does not
+// currently expose. Matches reported here are the savings a future
+// implementation would realize — see VENDOR_SOURCE.md #8 for the full
+// scope note.
+// ---------------------------------------------------------------------------
+
+/// Shape of the JSON envelope produced by hermes-agent's `read_context`
+/// tool (see `tools/read_context_tool.py`). Only `section_id` + `body` are
+/// load-bearing for detection. Any other fields are tolerated and ignored.
+#[derive(Debug, Deserialize)]
+struct ToolResultEnvelope {
+    section_id: String,
+    body: String,
+}
+
+/// SHA-256 the body text and return the first 16 lowercase hex chars —
+/// identical to hermes-agent's `hashlib.sha256(body.encode('utf-8'))
+/// .hexdigest()[:16]` (see `agent/context_summary.py`). Producing the same
+/// hash format is a wire-contract requirement: mismatched formatters would
+/// silently break lookups even on byte-identical bodies.
+fn body_hash_16(body: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(body.as_bytes());
+    let digest = hasher.finalize();
+    // Pre-allocate 16 chars of hex = 8 bytes of digest. Writing into a
+    // String with `write!` avoids an intermediate full-length hex encode.
+    let mut out = String::with_capacity(16);
+    for byte in &digest[..8] {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{:02x}", byte);
+    }
+    out
+}
+
+/// Detect which `role:"tool"` messages carry a body that matches a handle
+/// registered via Phase 2.1. Returns the sum of tokenized-body lengths
+/// across all matches (zero if no tool messages, zero if tool messages
+/// present but none match, `None` if no tool messages at all — so callers
+/// can distinguish "checked, nothing matched" from "nothing to check").
+///
+/// Behavior per tool message:
+/// 1. Try to parse `content` as the `read_context` JSON envelope
+///    `{"section_id": ..., "body": ...}`. Non-JSON / missing-field bodies
+///    are skipped (no match, no error).
+/// 2. Compute `body_hash_16(body)` and look up
+///    `load_metadata(section_id, body_hash)`. Missing metadata → no match.
+/// 3. On match, count `tokenizer.tokenize(body).len()` — this is the span
+///    a future mid-stream splice would import. Using the tokenizer rather
+///    than the stored `SectionMetadata.token_ids.len()` gives a count
+///    scoped to the body alone, since the stored count includes the
+///    system-role marker tokens baked in by `fill_system` at register time.
+pub fn detect_tool_result_matches(messages: &[ChatMessage], model: &Model) -> Option<u32> {
+    let mut saw_tool = false;
+    let mut total: u32 = 0;
+    let tokenizer = model.get_tokenizer();
+
+    for msg in messages {
+        if msg.role != "tool" {
+            continue;
+        }
+        saw_tool = true;
+
+        let env: ToolResultEnvelope = match serde_json::from_str(&msg.content) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let body_hash = body_hash_16(&env.body);
+        if load_metadata(&env.section_id, &body_hash).is_none() {
+            continue;
+        }
+        // Tokenize the body field specifically (not the full envelope).
+        // This reports the span the model will see INSIDE the tool-role
+        // wrapper when the chat template renders this message.
+        let n = tokenizer.tokenize(&env.body).len() as u32;
+        total = total.saturating_add(n);
+    }
+
+    if saw_tool { Some(total) } else { None }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,4 +426,36 @@ mod tests {
         let back: SectionMetadata = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.token_ids, meta.token_ids);
     }
+
+    #[test]
+    fn body_hash_16_matches_python_reference() {
+        // Cross-checked against:
+        //   hashlib.sha256(b"All variables ...").hexdigest()[:16]
+        // in agent/context_summary.py. A drift between the two formatters
+        // (different trunc length, upper vs lower hex, different encoding)
+        // would silently break Phase-3.0 detection on byte-identical bodies.
+        // Sample: SHA-256("hello world") =
+        //   b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+        // first 16 hex chars → "b94d27b9934d3e08".
+        assert_eq!(body_hash_16("hello world"), "b94d27b9934d3e08");
+    }
+
+    #[test]
+    fn body_hash_16_is_stable_for_empty() {
+        // Empty body is rejected at the register API (section-meta layer
+        // allows it through for serde, but the wire handler enforces
+        // non-empty). Record the empty hash so a future regression that
+        // stops rejecting empties in the register path would at least
+        // produce a deterministic, non-colliding detection value.
+        let h = body_hash_16("");
+        assert_eq!(h.len(), 16);
+        // SHA-256("") = e3b0c44298fc1c14... -> first 16 chars:
+        assert_eq!(h, "e3b0c44298fc1c14");
+    }
+
+    // `detect_tool_result_matches` depends on `Model::get_tokenizer()`,
+    // which is a WASI-backed call; constructing a Model here would require
+    // the wasm32-wasip2 target and a loaded engine. Exercise this end-to-
+    // end via the capture-run gate in bench/driver.py instead (see
+    // probe-read-context-one-call's `must_import_kv` assertion).
 }

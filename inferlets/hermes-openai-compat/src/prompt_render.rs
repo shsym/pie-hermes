@@ -1,9 +1,23 @@
 use crate::types::{ChatMessage, ChatTemplateKwargs, PromptPrefixSlot, PromptRenderContext, Tool};
 
-/// Section headers that vary per channel and should be moved after stable content.
-/// By placing these after the ~8K stable `# Project Context` block, APC can reuse
-/// prefix KV cache across channels instead of invalidating at position ~2,430.
-const DYNAMIC_SECTIONS: &[&str] = &["## Messaging", "## Reactions", "## Runtime"];
+/// Section headers that carry per-user / per-channel content and should be
+/// moved after the stable persona so prefix KV cache can be reused across
+/// different users of the same bearer.
+///
+/// Current hermes-agent (gateway/session.py::build_session_context_prompt)
+/// emits `## Current Session Context` as the dynamic block carrying
+/// user_name, chat_id, channel topic, home-channel list, and connected
+/// platforms. It is already appended to the tail of the system message via
+/// `ephemeral_system_prompt` in run_agent.py:8373-8375, so reorder is a
+/// no-op for well-formed hermes-agent traffic — but keep this list in sync
+/// with the actual dynamic markers so `hash_reordered_stable_prefix` cuts
+/// at the right boundary when callers send content out of order.
+///
+/// History: older hermes-agent deployments emitted `## Messaging`,
+/// `## Reactions`, and `## Runtime` as separate dynamic sections. Those
+/// headers no longer appear in current hermes-agent — see
+/// `memory/hermes_agent_deployment_shape.md`.
+const DYNAMIC_SECTIONS: &[&str] = &["## Current Session Context"];
 
 /// Reorder system message sections so channel-dependent sections appear after
 /// stable content. Non-system messages pass through unchanged.
@@ -280,9 +294,12 @@ mod tests {
 
     #[test]
     fn test_reorder_moves_dynamic_sections_after_stable() {
+        // Simulate a malformed request where hermes-agent's per-user
+        // `## Current Session Context` block landed BEFORE the stable
+        // persona. The reorder should float it back to the tail.
         let system = msg(
             "system",
-            "## Tooling\ntool stuff\n## Safety\nsafe stuff\n## Messaging\nmsg stuff\n## Reactions\nreact stuff\n# Project Context\nstable 8K block\n## Runtime\nruntime stuff",
+            "## Tooling\ntool stuff\n## Safety\nsafe stuff\n## Current Session Context\nSource: Discord (channel: #general)\n# Project Context\nstable 8K block",
         );
         let user = msg("user", "hello");
         let result = reorder_system_sections(&[system, user]);
@@ -290,14 +307,13 @@ mod tests {
         let sys_content = &result[0].content;
         // Stable sections come first
         assert!(sys_content.starts_with("## Tooling\ntool stuff\n## Safety\nsafe stuff"));
-        // Project Context before dynamic sections
+        // Project Context comes before the dynamic session-context block
         let ctx_pos = sys_content.find("# Project Context").unwrap();
-        let msg_pos = sys_content.find("## Messaging").unwrap();
-        let react_pos = sys_content.find("## Reactions").unwrap();
-        let runtime_pos = sys_content.find("## Runtime").unwrap();
-        assert!(ctx_pos < msg_pos, "Project Context should come before Messaging");
-        assert!(msg_pos < react_pos, "Messaging before Reactions (order preserved)");
-        assert!(react_pos < runtime_pos, "Reactions before Runtime (order preserved)");
+        let session_pos = sys_content.find("## Current Session Context").unwrap();
+        assert!(
+            ctx_pos < session_pos,
+            "Project Context should come before Current Session Context"
+        );
     }
 
     #[test]
@@ -309,7 +325,10 @@ mod tests {
 
     #[test]
     fn test_reorder_non_system_messages_pass_through() {
-        let user = msg("user", "## Reactions\nshould not be touched");
+        let user = msg(
+            "user",
+            "## Current Session Context\nshould not be touched when it's user-role content",
+        );
         let result = reorder_system_sections(&[user.clone()]);
         assert_eq!(result[0].content, user.content);
     }
@@ -392,12 +411,15 @@ mod tests {
 
     #[test]
     fn test_reorder_preserves_content_before_first_header() {
-        let system = msg("system", "preamble text\n## Reactions\nreact\n## Safety\nsafe");
+        let system = msg(
+            "system",
+            "preamble text\n## Current Session Context\nuser=alice\n## Safety\nsafe",
+        );
         let result = reorder_system_sections(&[system]);
         let c = &result[0].content;
-        // Preamble + Safety should come first, then Reactions
+        // Preamble + Safety should come first, then Current Session Context
         assert!(c.starts_with("preamble text\n## Safety\nsafe"), "got: {}", c);
-        assert!(c.ends_with("## Reactions\nreact"), "got: {}", c);
+        assert!(c.ends_with("## Current Session Context\nuser=alice"), "got: {}", c);
     }
 
     // --- Template rendering tests (kwargs plumbing) ---

@@ -181,6 +181,7 @@ def test_every_probe_expectation_has_known_keys():
         "must_call_tool",
         "must_not_call_tool",
         "must_call_tool_with_args",
+        "must_import_kv",
     }
     for slug, spec in PROBE_EXPECTATIONS.items():
         unknown = set(spec.keys()) - known

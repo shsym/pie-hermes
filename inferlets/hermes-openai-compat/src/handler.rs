@@ -304,6 +304,22 @@ pub async fn handle_chat_completions(
         }
     }
 
+    // Phase-3.0: scan inbound role:"tool" messages for bodies matching a
+    // context-section handle registered at boot via Phase 2.1 (see
+    // VENDOR_SOURCE.md #8). Detection-only today — KV path is unchanged.
+    //
+    // `detect_tool_result_matches` returns `None` when there are no tool
+    // messages (field stays absent — avoids conflating "no tools present"
+    // with "tools present but no match"), `Some(0)` when tool messages
+    // exist but none match a registered handle, and `Some(n)` with the
+    // sum of body-token counts on match. The field's presence/value is
+    // what the `must_import_kv` probe gate discriminates on.
+    let tool_match_tokens =
+        crate::context_section::detect_tool_result_matches(&request.messages, &prepared.model);
+    if let Some(cache) = prepared.pie_cache.as_mut() {
+        cache.tool_result_tokens_imported = tool_match_tokens;
+    }
+
     if request.stream {
         return handle_streaming(responder, prepared, &request, max_tokens, temperature, top_p, t_entry, t_json, t_prepare, body_len, adaptive_stop).await;
     }
@@ -1267,6 +1283,7 @@ async fn prepare_execution(
             tail_tokens_filled: None,
             fallback_reason: None,
             ephemeral_tokens_appended: None,
+            tool_result_tokens_imported: None,
         }),
         profile: PrepareProfile {
             format_chat_ms,
@@ -1360,6 +1377,7 @@ async fn prepare_variant_execution(
             tail_tokens_filled: None,
             fallback_reason: None,
             ephemeral_tokens_appended: None,
+            tool_result_tokens_imported: None,
         }),
         profile: PrepareProfile {
             format_chat_ms,
@@ -1380,12 +1398,13 @@ async fn prepare_session_execution(
     let t_start = std::time::Instant::now();
     let session_id = &request.pie_session.as_ref().unwrap().session_id;
 
-    // Reorder dynamic system sections (## Messaging/## Reactions/## Runtime) to
-    // the end before tokenization. This is required for the prefix checkpoint
-    // path to work across channels: the checkpoint stores tokens of the
-    // reordered stable prefix, and incoming tokens must use the same ordering
-    // so `find_prefix_match_len` sees an aligned prefix.  Session KV (Level 1)
-    // also uses the reordered form for consistency.
+    // Reorder dynamic system sections (## Current Session Context) to the
+    // end before tokenization. Required for the prefix checkpoint path to
+    // work across users on the same bearer: the checkpoint stores tokens
+    // of the reordered stable prefix, and incoming tokens must use the
+    // same ordering so `find_prefix_match_len` sees an aligned prefix.
+    // Session KV (Level 1) also uses the reordered form for consistency.
+    // See `prompt_render::DYNAMIC_SECTIONS` for the marker list.
     let reordered_messages = crate::prompt_render::reorder_system_sections(&request.messages);
 
     // Tokenize WITHOUT generation prompt (one call instead of two).
@@ -1478,6 +1497,7 @@ async fn prepare_session_execution(
                         tail_tokens_filled: Some(tail_len),
                         fallback_reason: None,
                         ephemeral_tokens_appended: None,
+                        tool_result_tokens_imported: None,
                     }),
                     profile: PrepareProfile {
                         format_chat_ms,
@@ -1536,6 +1556,7 @@ async fn prepare_session_execution(
                         tail_tokens_filled: Some(tail_len),
                         fallback_reason: None,
                         ephemeral_tokens_appended: None,
+                        tool_result_tokens_imported: None,
                     }),
                     profile: PrepareProfile {
                         format_chat_ms,
@@ -1601,6 +1622,7 @@ async fn prepare_session_execution(
                         tail_tokens_filled: Some(tail_len),
                         fallback_reason: Some("block_cache_hit".to_string()),
                         ephemeral_tokens_appended: None,
+                        tool_result_tokens_imported: None,
                     }),
                     profile: PrepareProfile {
                         format_chat_ms,
@@ -1649,6 +1671,7 @@ async fn prepare_session_execution(
             tail_tokens_filled: Some(total_incoming),
             fallback_reason: Some("full_prefill".to_string()),
             ephemeral_tokens_appended: None,
+            tool_result_tokens_imported: None,
         }),
         profile: PrepareProfile {
             format_chat_ms,
@@ -1704,6 +1727,7 @@ async fn prepare_structured_execution(
                     tail_tokens_filled: None,
                     fallback_reason: None,
                     ephemeral_tokens_appended: None,
+                    tool_result_tokens_imported: None,
                 }),
             )
             .await;
@@ -1736,6 +1760,7 @@ async fn prepare_structured_execution(
                         tail_tokens_filled: None,
                         fallback_reason: None,
                         ephemeral_tokens_appended: None,
+                        tool_result_tokens_imported: None,
                     }),
                 )
                 .await;
@@ -1770,6 +1795,7 @@ async fn prepare_structured_execution(
                         tail_tokens_filled: None,
                         fallback_reason: None,
                         ephemeral_tokens_appended: None,
+                        tool_result_tokens_imported: None,
                     }),
                 )
                 .await;
@@ -1831,6 +1857,7 @@ async fn prepare_structured_execution(
                     tail_tokens_filled: None,
                     fallback_reason: None,
                     ephemeral_tokens_appended: None,
+                    tool_result_tokens_imported: None,
                 }),
             )
             .await;
@@ -1863,6 +1890,7 @@ async fn prepare_structured_execution(
                             tail_tokens_filled: None,
                             fallback_reason: None,
                             ephemeral_tokens_appended: None,
+                            tool_result_tokens_imported: None,
                         }),
                     )
                     .await;
@@ -1939,6 +1967,7 @@ async fn prepare_structured_execution(
             tail_tokens_filled: None,
             fallback_reason: None,
             ephemeral_tokens_appended: None,
+            tool_result_tokens_imported: None,
         }),
         profile: PrepareProfile {
             format_chat_ms: validate_prefix_ms + format_chat_tail_ms,
@@ -2093,12 +2122,35 @@ fn save_session_kv_state(
 
     // Versioned export names: the runtime keeps exports as shared read-only
     // resources (import doesn't consume), so each turn must use a unique name.
-    // Old exports accumulate but are harmless — they reference the same
-    // physical pages (a subset of the current turn's pages).  They are
-    // cleaned up when the session is evicted (evict_session releases all).
-    let turn_count = crate::session_cache::load_session_state(session_id)
+    //
+    // Corrigendum — prior comment claimed "old exports accumulate but are
+    // harmless … cleaned up when the session is evicted (evict_session
+    // releases all)." That was wrong: `evict_session` only releases the
+    // CURRENT `state.export_name`, not prior turns'. The prior version of
+    // this code therefore leaked one export name per turn in the engine's
+    // resource registry. Observable symptom: after enough turns, a
+    // re-registration of the same (session_id, turn_count) pair hit
+    // ExportNameExists and the inferlet returned a truncated hyper response
+    // (see 2026-04-24 Phase-3.0 replay sweep FINDINGS).
+    //
+    // Fix: release the prior turn's export BEFORE we create the new one.
+    // This maintains exactly one live export per session at any time. The
+    // ordering (release-then-export, not export-then-release) is chosen for
+    // crash resilience: if we crash between release and export, the stored
+    // SessionKvState still points to the just-released name. The next
+    // load_session_state returns it, `import_kv_pages` finds no pages,
+    // `import_session_kv` returns None, and the request falls through to
+    // `prefix_checkpoint` or `full_prefill` — self-healing. The reverse
+    // order would leave a new export orphaned in the registry on the same
+    // crash window, with no state pointer to find it later.
+    let prior_state = crate::session_cache::load_session_state(session_id);
+    let turn_count = prior_state
+        .as_ref()
         .map(|s| s.turn_count + 1)
         .unwrap_or(1);
+    if let Some(prior) = &prior_state {
+        ctx.queue.release_exported_kv_pages(&prior.export_name);
+    }
 
     let export_name = format!("session-kv:{}:t{}", session_id, turn_count);
 
