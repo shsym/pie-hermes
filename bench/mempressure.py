@@ -6,12 +6,33 @@ configuration.  See docs/plans/2026-04-24-memory-pressure-eval-design.md
 for the full design.
 
 Modes (CLI subcommand):
-  pool-probe     — launch-time pool-match sanity check (item 13)
-  accuracy-probe — per-request cached-tokens/prefill-skipped probe (14)
-  run            — closed-loop steady-state throughput measurement (15)
+  pool-probe       — launch-time pool-match sanity check (item 13)
+  accuracy-probe   — per-request cached-tokens/prefill-skipped probe (14)
+  blockcache-smoke — end-to-end assertions on the block_cache LRU surface
+                     (budget plumbing, num_exports tracking, eviction under
+                     pressure, export_errors_total, touch() liveness)
+  run              — closed-loop steady-state throughput measurement (15)
 
 All modes accept --base-url (OpenAI-compat endpoint) and write results
 under bench/captures/runs/<RUN_ID>/ per the capture layout in §5.
+
+Budget sweep protocol (pie stack, `run` subcommand):
+  The block_cache LRU budget is a launch-time invariant — there is no
+  runtime setter.  Sweep arms by relaunching the inferlet between runs:
+
+    # Arm 1: unbounded
+    pie http --path hermes.wasm --port 18001
+    python3 -m bench.mempressure run --stack pie --budget-pages  # omit → unbounded
+
+    # Arm 2: 512 pages
+    pie http --path hermes.wasm --port 18002 -- --block-cache-budget-pages=512
+    python3 -m bench.mempressure run --stack pie --budget-pages 512 ...
+
+  Passing --budget-pages on the driver only affects manifest stamping
+  and a GET /status assertion — mismatch between driver and pod aborts
+  the run before any measurement is taken.  This is intentional: LRU
+  state from a prior arm's access tokens would contaminate the next
+  arm's steady-state measurement.
 """
 
 from __future__ import annotations
@@ -513,6 +534,190 @@ def cmd_accuracy_probe(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# End-to-end smoke: block_cache LRU surface
+# ---------------------------------------------------------------------------
+
+
+def _status(base_url: str) -> dict:
+    return json.loads(_http_get_text(base_url, "/v1/pie/block-cache/status"))
+
+
+def _warm_prefix(base_url: str, model: str, sys_prompt: str, bearer: str | None) -> None:
+    _http_post_json(
+        base_url,
+        "/v1/pie/prompt-cache/chat-prefix:warm",
+        {
+            "model": model,
+            "messages": [{"role": "system", "content": sys_prompt}],
+        },
+        timeout=180.0,
+        bearer=bearer,
+    )
+
+
+def _chat(base_url: str, model: str, sys_prompt: str, user: str, bearer: str | None) -> dict:
+    return _http_post_json(
+        base_url,
+        "/v1/chat/completions",
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.0,
+            "max_tokens": 8,
+            "stream": False,
+        },
+        timeout=180.0,
+        bearer=bearer,
+    )
+
+
+def cmd_blockcache_smoke(args: argparse.Namespace) -> int:
+    """End-to-end assertion probe for the block_cache LRU surface.
+
+    Validates the observable effects of this PR's changes against a
+    running pie pod:
+
+      1. `/status` reports `budget_pages` matching the pod's launch
+         flag (`--block-cache-budget-pages=<n>`); asserts the driver's
+         `--expect-budget` argument matches.
+      2. `export_errors_total == 0` on a clean pod — the
+         record_export_error counter is live and reads back cleanly.
+      3. Warming a fresh prefix bumps `num_exports`; a second distinct
+         prefix bumps it again — save path actually registers in LRU.
+      4. A chat request against a warmed prefix hits the cache
+         (`pie_cache.fallback_reason == "block_cache_hit"` or
+          `pie_cache.prefill_tokens_skipped > 0`).
+      5. A chat-path cache hit bumps `status.counter` — the `touch()`
+         liveness is observable.
+      6. (Optional, when `--expect-eviction-after N`) After warming N
+         distinct prefixes, `num_exports` plateaus and
+         `total_pinned_pages <= expect_budget + page_size_slack`, which
+         is only possible if the eviction + release path fired.
+
+    Exit 0 on pass; non-zero with a specific message on first failure.
+    """
+    base = args.base_url
+    bearer = args.bearer
+
+    # (1) launch-arg plumbing.
+    s0 = _status(base)
+    print(f"[1/6 status.initial] {s0}")
+    actual_budget = s0.get("budget_pages")
+    if actual_budget != args.expect_budget:
+        print(
+            f"FAIL: budget_pages={actual_budget!r} != expected {args.expect_budget!r}.\n"
+            f"  Pod must be launched with "
+            f"`-- --block-cache-budget-pages={args.expect_budget}` "
+            f"(omit the flag for unbounded).",
+            file=sys.stderr,
+        )
+        return 1
+
+    # (2) clean-pod error counter.
+    if s0.get("export_errors_total", -1) != 0:
+        print(
+            f"FAIL: export_errors_total={s0.get('export_errors_total')!r} "
+            "on a clean pod — previous run left errors, or counter wiring is broken.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # (3) warm two distinct prefixes, assert num_exports grows.
+    n0 = s0.get("num_exports", 0)
+    prefix_a = "You are prefix A." + " padding-a" * 200
+    prefix_b = "You are prefix B." + " padding-b" * 200
+    _warm_prefix(base, args.model, prefix_a, bearer)
+    s1 = _status(base)
+    print(f"[3/6 status.after_warm_A] {s1}")
+    if s1.get("num_exports", 0) <= n0:
+        print(
+            f"FAIL: num_exports did not increase after warming prefix A "
+            f"(before={n0}, after={s1.get('num_exports')}).",
+            file=sys.stderr,
+        )
+        return 1
+
+    _warm_prefix(base, args.model, prefix_b, bearer)
+    s2 = _status(base)
+    print(f"[3/6 status.after_warm_B] {s2}")
+    if s2.get("num_exports", 0) <= s1.get("num_exports", 0):
+        print(
+            f"FAIL: num_exports did not increase after warming prefix B "
+            f"(before={s1.get('num_exports')}, after={s2.get('num_exports')}).",
+            file=sys.stderr,
+        )
+        return 1
+
+    # (4) chat-path cache hit.
+    resp = _chat(base, args.model, prefix_a, "Say ok.", bearer)
+    pie = resp.get("pie_cache") or {}
+    skipped = int(pie.get("prefill_tokens_skipped") or 0)
+    reason = pie.get("fallback_reason") or ""
+    hit = skipped > 0 or reason == "block_cache_hit"
+    print(f"[4/6 chat.pie_cache] skipped={skipped} fallback_reason={reason!r}")
+    if not hit:
+        print(
+            "FAIL: chat request against warmed prefix did not report a cache hit. "
+            "Neither prefill_tokens_skipped>0 nor fallback_reason=='block_cache_hit'.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # (5) touch() liveness: counter must have advanced.
+    s3 = _status(base)
+    print(f"[5/6 status.after_chat] {s3}")
+    if s3.get("counter", 0) <= s2.get("counter", 0):
+        print(
+            f"FAIL: counter did not advance across the chat-path hit "
+            f"(before={s2.get('counter')}, after={s3.get('counter')}) — "
+            "touch() is not wired to the import-prefix path.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # (6) optional eviction assertion.
+    if args.expect_eviction_after is not None:
+        if args.expect_budget is None:
+            print(
+                "FAIL: --expect-eviction-after requires --expect-budget; "
+                "cannot validate eviction under an unbounded budget.",
+                file=sys.stderr,
+            )
+            return 1
+        n_extra = args.expect_eviction_after
+        for i in range(n_extra):
+            filler = f"You are prefix SMOKE-{i}." + f" padding-{i}" * 200
+            _warm_prefix(base, args.model, filler, bearer)
+        s4 = _status(base)
+        print(f"[6/6 status.after_pressure] {s4}")
+        if s4.get("total_pinned_pages", 0) > args.expect_budget + args.page_size_slack:
+            print(
+                f"FAIL: total_pinned_pages={s4.get('total_pinned_pages')} "
+                f"exceeds budget {args.expect_budget} by more than the allowed "
+                f"slack {args.page_size_slack} — eviction did not fire.",
+                file=sys.stderr,
+            )
+            return 1
+        if s4.get("export_errors_total", 0) != 0:
+            print(
+                f"FAIL: export_errors_total={s4.get('export_errors_total')} — "
+                f"export failures during eviction sweep. Last error: "
+                f"{s4.get('last_export_error')!r}",
+                file=sys.stderr,
+            )
+            return 1
+
+    print("PASS: block_cache end-to-end smoke (budget plumbing, num_exports, "
+          "chat-path hit, touch() liveness"
+          + (", eviction fire" if args.expect_eviction_after is not None else "")
+          + ")")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Closed-loop benchmark runner (item 15)
 # ---------------------------------------------------------------------------
 
@@ -650,16 +855,35 @@ def _build_request_bodies(
     raise ValueError(f"unknown scenario {scenario}")
 
 
-def _set_pie_budget(base_url: str, budget_pages: int | None) -> None:
+def _verify_pie_budget(base_url: str, expected: int | None) -> None:
+    """Confirm the pod was launched with the expected
+    `--block-cache-budget-pages` value by scraping `/v1/pie/block-cache/status`.
+    Budget is a launch-time invariant — there is no HTTP setter — so the
+    driver's job here is to fail loudly when the operator forgot to bake
+    the sweep variable into the launch args rather than silently
+    collecting a run under the wrong configuration.
+    """
     try:
-        resp = _http_post_json(
-            base_url,
-            "/v1/pie/block-cache/config",
-            {"budget_pages": budget_pages},
+        status = json.loads(
+            _http_get_text(base_url, "/v1/pie/block-cache/status")
         )
-        print(f"[config] set pie block_cache budget_pages={budget_pages}: {resp}")
     except Exception as e:
-        print(f"[config] could not set pie budget ({e}) — stack may be stock vLLM", file=sys.stderr)
+        print(
+            f"[config] could not GET /v1/pie/block-cache/status ({e}) — "
+            "stack may be stock vLLM; skipping verification",
+            file=sys.stderr,
+        )
+        return
+    actual = status.get("budget_pages")
+    print(f"[config] pie block_cache status={status}")
+    if actual != expected:
+        raise SystemExit(
+            f"[config] FATAL: expected budget_pages={expected!r}, pod reports {actual!r}.\n"
+            f"  Relaunch the inferlet with "
+            f"`pie http --path <hermes.wasm> --port <p> -- "
+            f"--block-cache-budget-pages={expected}` "
+            f"(omit the flag for unbounded)."
+        )
 
 
 def _maybe_warmup(base_url: str, stack: str, scenario: str, model: str, bearer: str | None = None) -> None:
@@ -736,7 +960,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     if args.stack == "pie":
-        _set_pie_budget(args.base_url, args.budget_pages)
+        # Budget is set at pod launch (`--block-cache-budget-pages=<n>`);
+        # we only verify that --budget-pages on the driver matches what
+        # the pod actually reports.  Mismatch is a fatal configuration
+        # error — the sweep variable has silently escaped the run.
+        _verify_pie_budget(args.base_url, args.budget_pages)
 
     print(f"[warmup] firing warmup request(s) for scenario={args.scenario}")
     _maybe_warmup(args.base_url, args.stack, args.scenario, args.model, bearer=args.bearer)
@@ -884,6 +1112,29 @@ def main(argv: list[str]) -> int:
     p_acc.add_argument("--skip-warmup-endpoint", action="store_true",
                        help="skip pie warmup endpoint (fall back to chat warmup)")
 
+    p_smoke = sub.add_parser(
+        "blockcache-smoke",
+        help="end-to-end assertions on the block_cache LRU surface",
+    )
+    _add_common_run_args(p_smoke)
+    p_smoke.add_argument(
+        "--expect-budget", type=int, default=None,
+        help="Expected value of /status.budget_pages (must match the pod's "
+             "--block-cache-budget-pages launch flag). Omit to expect unbounded.",
+    )
+    p_smoke.add_argument(
+        "--expect-eviction-after", type=int, default=None, metavar="N",
+        help="After warming N additional distinct prefixes under a tight "
+             "--expect-budget, assert that total_pinned_pages stayed bounded "
+             "(eviction fired). Omit to skip the eviction assertion.",
+    )
+    p_smoke.add_argument(
+        "--page-size-slack", type=int, default=16,
+        help="Allowed over-budget slack (pages) for the eviction assertion; "
+             "accommodates a single in-flight entry that exceeds budget by "
+             "a fraction of one page. Default 16 (one KV page).",
+    )
+
     p_run = sub.add_parser("run", help="closed-loop throughput measurement")
     _add_common_run_args(p_run)
     p_run.add_argument("--scenario", required=True, choices=["s1", "s2", "s3"])
@@ -893,7 +1144,11 @@ def main(argv: list[str]) -> int:
     p_run.add_argument("--max-tokens", type=int, default=64)
     p_run.add_argument("--req-timeout-sec", type=float, default=300.0)
     p_run.add_argument("--budget-pages", type=int, default=None,
-                       help="pie block_cache budget (pages). Omit = no eviction")
+                       help="pie block_cache budget (pages). Must match the "
+                            "value baked into the pod's launch args "
+                            "(--block-cache-budget-pages=<n>); the driver "
+                            "verifies via /v1/pie/block-cache/status and "
+                            "aborts on mismatch. Omit = unbounded.")
     p_run.add_argument("--captures-root", default=str(
         Path(__file__).resolve().parent / "captures"))
     p_run.add_argument("--notes", default="")
@@ -903,6 +1158,8 @@ def main(argv: list[str]) -> int:
         return cmd_pool_probe(args)
     if args.cmd == "accuracy-probe":
         return cmd_accuracy_probe(args)
+    if args.cmd == "blockcache-smoke":
+        return cmd_blockcache_smoke(args)
     if args.cmd == "run":
         return cmd_run(args)
     parser.print_help()

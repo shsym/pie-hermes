@@ -158,48 +158,19 @@ pub async fn handle_chat_prefix_warm(body_bytes: Vec<u8>, responder: Responder) 
     responder.respond(http_response).await
 }
 
-/// POST /v1/pie/block-cache/config
-///
-/// Sets the block_cache LRU budget (max total pinned KV pages across
-/// all exports).  Body: `{"budget_pages": <u64 or null>}`.  Null clears
-/// the budget — unbounded growth (original shipping behavior).
-///
-/// Used by the memory-pressure benchmark (task #47) to sweep B per arm.
-pub async fn handle_block_cache_config(
-    body_bytes: Vec<u8>,
-    responder: Responder,
-) -> Finished {
-    #[derive(serde::Deserialize)]
-    struct ConfigBody {
-        budget_pages: Option<usize>,
-    }
-    let body: ConfigBody = match serde_json::from_slice(&body_bytes) {
-        Ok(b) => b,
-        Err(e) => {
-            return crate::error_response(responder, 400, &format!("Invalid JSON: {}", e)).await;
-        }
-    };
-    crate::block_cache::set_budget(body.budget_pages);
-    let status = crate::block_cache::status();
-    let resp_json = match serde_json::to_string(&status) {
-        Ok(s) => s,
-        Err(e) => {
-            return crate::error_response(responder, 500, &format!("status serialize: {}", e)).await;
-        }
-    };
-    let http_response = Response::builder()
-        .header("Content-Type", "application/json")
-        .body(resp_json.into_body())
-        .unwrap();
-    responder.respond(http_response).await
-}
-
 /// GET /v1/pie/block-cache/status
 ///
-/// Returns the current LRU index summary: budget, number of pinned
-/// exports, total pinned pages, access counter.  Used by the benchmark
-/// driver to verify eviction fired and by the accuracy probe (§6.3)
-/// to confirm pinned pages are < budget after each arm.
+/// Returns the current block-cache state: configured budget (from the
+/// launch flag `--block-cache-budget-pages=<n>`), number of pinned
+/// exports, total pinned pages, monotonic access counter, and cumulative
+/// `export_kv_pages_sync` error stats.  Used by the benchmark driver to
+/// verify eviction fired and by the accuracy probe (§6.3) to confirm
+/// pinned pages are < budget after each arm.
+///
+/// There is intentionally no companion POST endpoint — the budget is a
+/// launch-time invariant.  Sweeping budgets requires relaunching the
+/// inferlet instance with a different `--block-cache-budget-pages`
+/// value.  See `block_cache.rs` module docstring for rationale.
 pub async fn handle_block_cache_status(responder: Responder) -> Finished {
     let status = crate::block_cache::status();
     let resp_json = match serde_json::to_string(&status) {
@@ -2131,7 +2102,16 @@ fn save_session_kv_state(
     // sync stderr write from this context wedges the request's HTTP response
     // (see test_no_sync_eprintln.rs; task #47 N≥8 IncompleteMessage repro
     // pinned the wedge here).
-    if ctx.queue.export_kv_pages_sync(&ctx.kv_pages, &export_name).is_err() {
+    //
+    // Observability: record the failure in kvs so `/v1/pie/block-cache/status`
+    // surfaces a counter + the most recent message.  `inferlet::store_set`
+    // is not stderr and does not wedge (kvs rides the normal command
+    // dispatcher, not a synchronous i/o handle).
+    if let Err(e) = ctx.queue.export_kv_pages_sync(&ctx.kv_pages, &export_name) {
+        crate::block_cache::record_export_error(&format!(
+            "export_kv_pages_sync({}): {}",
+            export_name, e
+        ));
         return;
     }
 
