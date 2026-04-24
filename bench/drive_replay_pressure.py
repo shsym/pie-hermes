@@ -52,31 +52,33 @@ DEFAULT_SOURCE = Path(
 
 
 def _scen(slug: str, *, source: Path, n_users: int, pattern: str,
-          rounds: int = 1) -> ReplayScenario:
+          rounds: int = 1, bearer_prefix: str = "replay") -> ReplayScenario:
     return ReplayScenario(
         slug=slug, source_capture_path=source,
         n_users=n_users, pattern=pattern, rounds=rounds,  # type: ignore[arg-type]
+        bearer_prefix=bearer_prefix,
     )
 
 
-def _build_presets(source: Path) -> dict[str, list[ReplayScenario]]:
+def _build_presets(source: Path, bearer_prefix: str = "replay") -> dict[str, list[ReplayScenario]]:
+    _s = lambda slug, **kw: _scen(slug, source=source, bearer_prefix=bearer_prefix, **kw)
     return {
         "phase-3.0-replay-sessions": [
             # Low N — both patterns should hit similarly (little contention
             # on session slot since few switches happen).
-            _scen("replay-N10-seq", source=source, n_users=10, pattern="sequential"),
-            _scen("replay-N10-ilv", source=source, n_users=10, pattern="interleaved"),
+            _s("replay-N10-seq", n_users=10, pattern="sequential"),
+            _s("replay-N10-ilv", n_users=10, pattern="interleaved"),
             # Mid N — thrash signal should appear in interleaved.
-            _scen("replay-N50-seq", source=source, n_users=50, pattern="sequential"),
-            _scen("replay-N50-ilv", source=source, n_users=50, pattern="interleaved"),
+            _s("replay-N50-seq", n_users=50, pattern="sequential"),
+            _s("replay-N50-ilv", n_users=50, pattern="interleaved"),
             # High N — pure thrash in interleaved; sequential still retains
             # per-user warm turns. Delta here is the session-cache-is-
             # single-slot evidence quantified.
-            _scen("replay-N200-seq", source=source, n_users=200, pattern="sequential"),
-            _scen("replay-N200-ilv", source=source, n_users=200, pattern="interleaved"),
+            _s("replay-N200-seq", n_users=200, pattern="sequential"),
+            _s("replay-N200-ilv", n_users=200, pattern="interleaved"),
         ],
         "phase-3.0-replay-smoke": [
-            _scen("replay-smoke-N2-seq", source=source, n_users=2, pattern="sequential"),
+            _s("replay-smoke-N2-seq", n_users=2, pattern="sequential"),
         ],
     }
 
@@ -167,9 +169,15 @@ def main(argv: list[str]) -> int:
                    help="Per-request wall-clock estimate for cost preflight.")
     p.add_argument("--kv-capacity-tokens", type=int, default=None)
     p.add_argument("--yes", action="store_true")
+    p.add_argument("--bearer-prefix", default="replay",
+                   help="Isolation prefix for `Authorization: Bearer <prefix>-uNNNN`. "
+                        "Change between sweeps on the same pod to avoid session-cache "
+                        "state from prior runs colliding on ExportNameExists errors "
+                        "(session exports accumulate per turn and only the latest is "
+                        "released on eviction — see session_cache.rs:160).")
     args = p.parse_args(argv)
 
-    presets = _build_presets(args.source)
+    presets = _build_presets(args.source, bearer_prefix=args.bearer_prefix)
     if args.preset not in presets:
         print(f"[abort] unknown preset {args.preset!r} "
               f"(known: {sorted(presets)})", file=sys.stderr)
