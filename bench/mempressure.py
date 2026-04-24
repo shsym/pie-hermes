@@ -319,11 +319,20 @@ def s3_noise_pool(n: int = 200, seed: int = 0) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _http_post_json(base_url: str, path: str, body: dict, timeout: float = 120.0) -> dict:
+def _http_post_json(
+    base_url: str,
+    path: str,
+    body: dict,
+    timeout: float = 120.0,
+    bearer: str | None = None,
+) -> dict:
+    headers = {"Content-Type": "application/json"}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
     req = urllib.request.Request(
         base_url.rstrip("/") + path,
         data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -349,6 +358,8 @@ def _scrape_prefix_cache_metrics(base_url: str) -> dict[str, float]:
         if line.startswith("#") or not line:
             continue
         for metric in (
+            "vllm:prefix_cache_queries_total",
+            "vllm:prefix_cache_hits_total",
             "vllm:prefix_cache_queries",
             "vllm:prefix_cache_hits",
             "vllm:gpu_cache_usage_perc",
@@ -356,11 +367,16 @@ def _scrape_prefix_cache_metrics(base_url: str) -> dict[str, float]:
             "vllm:num_requests_waiting",
         ):
             if line.startswith(metric):
-                # last whitespace-separated token is the value
+                # Use the full metric name *including* labels as the key
+                # so we can diff across scrapes. For aggregate views the
+                # metric-name prefix alone is enough; keep the first one
+                # we find per metric.
                 try:
-                    out[metric] = float(line.rsplit(None, 1)[-1])
+                    value = float(line.rsplit(None, 1)[-1])
                 except ValueError:
-                    pass
+                    break
+                if metric not in out:
+                    out[metric] = value
                 break
     return out
 
@@ -449,9 +465,15 @@ def cmd_accuracy_probe(args: argparse.Namespace) -> int:
         "max_tokens": 8,
         "stream": False,
     }
+    # Scrape Prometheus before and after two identical requests.  On
+    # stock vLLM the OpenAI response's prompt_tokens_details is often
+    # null (vLLM build/version dependent, see issue #31920) — Prometheus
+    # counters are the ground truth.
+    pre_m = _scrape_prefix_cache_metrics(base_url)
+    cached = skipped = None
     for i in range(2):
         t0 = time.perf_counter()
-        resp = _http_post_json(base_url, "/v1/chat/completions", body, timeout=180.0)
+        resp = _http_post_json(base_url, "/v1/chat/completions", body, timeout=180.0, bearer=getattr(args, "bearer", None))
         t1 = time.perf_counter()
         usage = resp.get("usage") or {}
         details = usage.get("prompt_tokens_details") or {}
@@ -464,15 +486,29 @@ def cmd_accuracy_probe(args: argparse.Namespace) -> int:
             f"cached_tokens={cached}  "
             f"pie_cache.prefill_tokens_skipped={skipped}"
         )
+    post_m = _scrape_prefix_cache_metrics(base_url)
+
+    qk = "vllm:prefix_cache_queries_total"
+    hk = "vllm:prefix_cache_hits_total"
+    # Prometheus names on some vLLM versions: *_total suffix. Handle both.
+    qk_alt = "vllm:prefix_cache_queries"
+    hk_alt = "vllm:prefix_cache_hits"
+    d_q = (post_m.get(qk) or post_m.get(qk_alt) or 0) - (pre_m.get(qk) or pre_m.get(qk_alt) or 0)
+    d_h = (post_m.get(hk) or post_m.get(hk_alt) or 0) - (pre_m.get(hk) or pre_m.get(hk_alt) or 0)
+    print(f"[prometheus delta] queries={d_q} hits={d_h}")
 
     last_cached = cached or 0
     last_skipped = skipped or 0
-    if max(last_cached, last_skipped) == 0:
-        print("FAIL: no hit reported on second identical request.", file=sys.stderr)
-        print("  Hits on stock vLLM: check prompt_tokens_details.cached_tokens.")
-        print("  Hits on pie: check pie_cache.prefill_tokens_skipped.")
+    hit_signal = max(last_cached, last_skipped, d_h)
+    if hit_signal == 0:
+        print("FAIL: no hit reported on second identical request via any signal.", file=sys.stderr)
+        print("  OpenAI response: prompt_tokens_details.cached_tokens (stock vLLM) /"
+              " pie_cache.prefill_tokens_skipped (pie)")
+        print("  Prometheus: vllm:prefix_cache_hits_total delta")
         return 1
-    print(f"PASS: cache hit reported (cached={last_cached}, skipped={last_skipped})")
+    src = "openai-field" if (last_cached or last_skipped) else "prometheus"
+    print(f"PASS: cache hit reported via {src} "
+          f"(openai cached={last_cached} skipped={last_skipped} prom_hit_delta={d_h})")
     return 0
 
 
@@ -498,10 +534,11 @@ def _one_request(
     body: dict,
     req_id: str,
     timeout: float,
+    bearer: str | None = None,
 ) -> RequestResult:
     t0 = time.perf_counter()
     try:
-        resp = _http_post_json(base_url, "/v1/chat/completions", body, timeout=timeout)
+        resp = _http_post_json(base_url, "/v1/chat/completions", body, timeout=timeout, bearer=bearer)
     except Exception as e:
         t1 = time.perf_counter()
         return RequestResult(
@@ -625,7 +662,7 @@ def _set_pie_budget(base_url: str, budget_pages: int | None) -> None:
         print(f"[config] could not set pie budget ({e}) — stack may be stock vLLM", file=sys.stderr)
 
 
-def _maybe_warmup(base_url: str, stack: str, scenario: str, model: str) -> None:
+def _maybe_warmup(base_url: str, stack: str, scenario: str, model: str, bearer: str | None = None) -> None:
     """Fire one warmup request per unique prefix in the scenario.  For
     pie, try the warmup endpoint first; fall back to a normal chat
     request if the endpoint 404s."""
@@ -659,12 +696,13 @@ def _maybe_warmup(base_url: str, stack: str, scenario: str, model: str) -> None:
                 "/v1/pie/prompt-cache/chat-prefix:warm",
                 {"model": model, "messages": prefix_msgs},
                 timeout=180.0,
+                bearer=bearer,
             )
             return
         except Exception as e:
             print(f"[warmup] pie endpoint failed ({e}); falling back to chat warmup")
 
-    _http_post_json(base_url, "/v1/chat/completions", warmup_body, timeout=180.0)
+    _http_post_json(base_url, "/v1/chat/completions", warmup_body, timeout=180.0, bearer=bearer)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -701,7 +739,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         _set_pie_budget(args.base_url, args.budget_pages)
 
     print(f"[warmup] firing warmup request(s) for scenario={args.scenario}")
-    _maybe_warmup(args.base_url, args.stack, args.scenario, args.model)
+    _maybe_warmup(args.base_url, args.stack, args.scenario, args.model, bearer=args.bearer)
 
     pre_metrics = _scrape_prefix_cache_metrics(args.base_url)
     (run_dir / "vllm_metrics_pre.json").write_text(json.dumps(pre_metrics, indent=2))
@@ -726,7 +764,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             body = bodies[(req_counter[0] - 1) % len(bodies)]
             req_id = f"r{req_counter[0]:06d}"
             fut = pool.submit(
-                _one_request, args.base_url, body, req_id, args.req_timeout_sec
+                _one_request, args.base_url, body, req_id, args.req_timeout_sec, args.bearer
             )
             in_flight.add(fut)
 
@@ -822,6 +860,11 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--stack", required=True, choices=["stockvllm", "pie"])
     p.add_argument("--model", required=True,
                    help="Model name to send in chat-completions body")
+    p.add_argument("--bearer", default=None,
+                   help="Bearer token. REQUIRED for pie stack: block_cache lookup is gated "
+                        "behind pie_session.is_some() (handler.rs:1226), which in turn requires "
+                        "a non-empty bearer for auto-derivation (handler.rs:319). Stock vLLM "
+                        "ignores this.")
 
 
 def main(argv: list[str]) -> int:
