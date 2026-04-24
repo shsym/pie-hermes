@@ -2064,13 +2064,14 @@ fn save_session_kv_state(
 
     // Synchronous export: if the engine rejects the ptrs list (e.g. a ref-
     // count accounting edge case removed a ptr from the instance's allocated
-    // set between import and export), we observe the Err here and skip
-    // save_session_state. The next turn's load_session_state then returns
-    // the prior valid state (or None, triggering prefix_checkpoint / full
-    // prefill), instead of loading a name the engine has no record of and
-    // crashing via the import-of-missing-export path.
-    if let Err(e) = ctx.queue.export_kv_pages_sync(&ctx.kv_pages, &export_name) {
-        eprintln!("[pieclaw] export_kv_pages_sync failed for {export_name}: {e} — skipping save_session_state");
+    // set between import and export, or an ExportNameExists collision with a
+    // concurrent request sharing the same session_id), skip save_session_state
+    // silently. NO eprintln! here — we are executing inside a sync helper
+    // called from an async-executed handler, and on wasm32-wasip2/wstd a
+    // sync stderr write from this context wedges the request's HTTP response
+    // (see test_no_sync_eprintln.rs; task #47 N≥8 IncompleteMessage repro
+    // pinned the wedge here).
+    if ctx.queue.export_kv_pages_sync(&ctx.kv_pages, &export_name).is_err() {
         return;
     }
 
