@@ -158,6 +158,34 @@ pub async fn handle_chat_prefix_warm(body_bytes: Vec<u8>, responder: Responder) 
     responder.respond(http_response).await
 }
 
+/// GET /v1/pie/block-cache/status
+///
+/// Returns the current block-cache state: configured budget (from the
+/// launch flag `--block-cache-budget-pages=<n>`), number of pinned
+/// exports, total pinned pages, monotonic access counter, and cumulative
+/// `export_kv_pages_sync` error stats.  Used by the benchmark driver to
+/// verify eviction fired and by the accuracy probe (§6.3) to confirm
+/// pinned pages are < budget after each arm.
+///
+/// There is intentionally no companion POST endpoint — the budget is a
+/// launch-time invariant.  Sweeping budgets requires relaunching the
+/// inferlet instance with a different `--block-cache-budget-pages`
+/// value.  See `block_cache.rs` module docstring for rationale.
+pub async fn handle_block_cache_status(responder: Responder) -> Finished {
+    let status = crate::block_cache::status();
+    let resp_json = match serde_json::to_string(&status) {
+        Ok(s) => s,
+        Err(e) => {
+            return crate::error_response(responder, 500, &format!("status serialize: {}", e)).await;
+        }
+    };
+    let http_response = Response::builder()
+        .header("Content-Type", "application/json")
+        .body(resp_json.into_body())
+        .unwrap();
+    responder.respond(http_response).await
+}
+
 /// Handle POST /v1/chat/completions.
 pub async fn handle_chat_completions(
     body_bytes: Vec<u8>,
@@ -1609,6 +1637,9 @@ async fn prepare_session_execution(
                 &incoming_tokens,
                 page_size,
             ) {
+                // Touch LRU so this hot prefix is protected from eviction
+                // on the next warmup save under a tight budget.
+                crate::block_cache::touch(&export_name);
                 let import_ms = t_import.elapsed().as_secs_f64() * 1000.0;
                 let tail = incoming_tokens[matched_tokens..].to_vec();
                 let tail_len = tail.len() as u32;
@@ -2192,13 +2223,27 @@ fn save_session_kv_state(
     // count accounting edge case removed a ptr from the instance's allocated
     // set between import and export, or an ExportNameExists collision with a
     // concurrent request sharing the same session_id), skip save_session_state
-    // but surface a tag via the returned Err so the async caller can annotate
-    // `pie_cache.session_kv_save_error`. NO eprintln! here — we are executing
+    // but surface the failure on TWO axes so an operator can see it both
+    // per-request and pod-aggregate. NO eprintln! here — we are executing
     // inside a sync helper called from an async-executed handler, and on
     // wasm32-wasip2/wstd a sync stderr write from this context wedges the
     // request's HTTP response (see test_no_sync_eprintln.rs; task #47 N≥8
     // IncompleteMessage repro pinned the wedge here).
-    if ctx.queue.export_kv_pages_sync(&ctx.kv_pages, &export_name).is_err() {
+    //
+    // Observability layers, both wedge-safe (kvs and the Result return
+    // both ride the normal command dispatcher, not a synchronous i/o handle):
+    //   1. Per-request: return `Err(tag)` so `save_session_kv_state_and_annotate`
+    //      writes the tag into `pie_cache.session_kv_save_error` (visible to
+    //      the failing request's caller).
+    //   2. Pod-aggregate: bump `bc:stats:export_errors_total` and record the
+    //      most recent message in `bc:stats:last_export_error`, exposed via
+    //      `GET /v1/pie/block-cache/status` (visible to operators monitoring
+    //      across requests).
+    if let Err(e) = ctx.queue.export_kv_pages_sync(&ctx.kv_pages, &export_name) {
+        crate::block_cache::record_export_error(&format!(
+            "export_kv_pages_sync({}): {}",
+            export_name, e
+        ));
         return Err("export_kv_pages_sync_err");
     }
 
