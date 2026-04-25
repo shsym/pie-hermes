@@ -31,6 +31,14 @@ Thumbs.db
 
 # --- Local pie endpoint override (contains the live pod URL) ---
 configs/cli-config.pie.local.yaml
+# Per-run derived config variants (sed'd from base templates at invocation time).
+configs/cli-config.*.local.yaml
+configs/cli-config.qwen35.fp8.yaml
+configs/cli-config.qwen35.9b.yaml
+
+# --- Experimental / research logs (per CLAUDE.md: don't commit docs). ---
+# Contains per-task REPORTs, raw pod logs, one-off probe scripts.
+/logs/
 
 # --- Scratch space used by scripts/run_in_container.sh ---
 bench/_tmp/
@@ -40,7 +48,15 @@ test-*.log
 test-logs/
 
 # --- Capture runs are reproducible artifacts — don't commit them. ---
+# Two locations: repo-root `captures/` (legacy) and `bench/captures/` (the
+# current driver writes here — task #47's bench/mempressure.py + task #48's
+# bench/correctness_high_c.py both land under bench/captures/runs/).
 captures/runs/*
+bench/captures/
+
+# --- Ad-hoc investigation logs (REPORT.md, probe outputs, raw .log files). ---
+# Same rationale as /docs/ below — local-only scratch, per CLAUDE.md.
+/logs/
 
 # --- Plans / working docs — local only (CLAUDE.md: "don't commit docs"). ---
 # Scoped to repo-root /docs/ so nested `docs/` dirs inside submodules or

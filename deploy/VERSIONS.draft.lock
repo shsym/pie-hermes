@@ -1,0 +1,73 @@
+# pie-hermes distribution — DRAFT manifest (not yet a true lock file).
+#
+# STATUS: entries marked "TBD-at-release" (hermes_agent.pinned_sha,
+# pie.pinned_sha, inferlets.hermes_openai_compat.wasm_sha256) are filled
+# by the release pipeline (hc #33 / #34). Until then, this file serves
+# as a human-readable qualification manifest + operational reference,
+# not a reproducible install manifest. It is renamed from VERSIONS.lock
+# to VERSIONS.draft.lock to avoid over-promising lock semantics.
+#
+# Updated by task #35 qualification run on 2026-04-23.
+
+[qualification_run]
+# Qualification evidence for the entries below.
+report = "deploy/COMPATIBILITY.md"
+analyzer = "bench/analyze_tool_reliability.py"
+scenario_subset = "bench/scenarios/tool_reliability_subset.md"
+harness_version = "2026-04-23"
+pod = "A40 48GB on RunPod, image sslee0cs/pie-vllm-engine:pieclaw-home"
+vllm_version = "0.17.0"
+torch_version = "2.10.0+cu128"
+
+[models.capable_primary]
+hf_repo = "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
+approx_weights_gib = 21.06
+approx_kv_at_64k_gib = 17.0
+min_gpu = "NVIDIA A40 (48 GB)"
+vllm_extra_args = ""
+# qualification metrics (syntax / selection / completion / discipline)
+qualified = "100 / 100 / 100 / 100"
+
+[models.capable_quality]
+hf_repo = "Qwen/Qwen3.5-35B-A3B-FP8"
+approx_weights_gib = 34.71
+approx_kv_at_64k_gib = 3.35
+min_gpu = "NVIDIA A40 (48 GB) with --enforce-eager; A100 80 GB can drop the flag"
+vllm_extra_args = "--enforce-eager"
+qualified = "100 / 100 / 100 / 100"
+
+[models.working]
+hf_repo = "Qwen/Qwen3.5-9B"
+approx_weights_gib = 17.66
+min_gpu = "Any 24 GB+ GPU (tested on A40)"
+vllm_extra_args = ""
+qualified = "100 / 100 / 86 / 100"
+
+[vllm_serve_flags]
+# REQUIRED for Qwen3.5 tool-calling through Hermes. Do NOT use
+# --tool-call-parser hermes — experimentally shown to strip all output
+# (run 2026-04-23T04-37-24_qwen35-35b-a3b-int4_tool-use-t3).
+max_model_len = 65536
+gpu_memory_utilization = 0.90
+trust_remote_code = true
+reasoning_parser = "qwen3"
+enable_auto_tool_choice = true
+tool_call_parser = "qwen3_coder"
+
+[hermes_agent]
+# Upstream pristine fork. Pin on the packaging-release tag cut.
+submodule_path = "hermes-agent"
+source = "https://github.com/shsym/hermes-agent.git"
+# Commit sha to be filled in when we cut a distribution release.
+pinned_sha = "TBD-at-release"
+
+[pie]
+submodule_path = "pie-vllm"
+source = "https://github.com/shsym/pie-vllm.git"
+pinned_sha = "TBD-at-release"
+
+[inferlets.hermes_openai_compat]
+path = "inferlets/hermes-openai-compat/"
+wasm_artifact = "hermes_openai_compat.wasm"
+# sha256 filled by GH Release pipeline (task #33)
+wasm_sha256 = "TBD-at-release"

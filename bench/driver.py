@@ -214,6 +214,13 @@ SCENARIOS: dict[str, tuple[str, int, str, list[str]]] = {
 #   "must_not_call_tool":       list[str]  — these tool names MUST NOT appear in any assistant message's tool_calls
 #   "must_call_tool_with_args": dict[str, dict] — per-tool partial-match on args; for each entry, the named tool must
 #                                                 be called at least once with args containing every key/value pair listed
+#   "must_import_kv":           dict         — at least one captured pie_cache.tool_result_tokens_imported value must
+#                                              be >= min_tokens across all rows/chunks of the scenario. Shape:
+#                                                  {"min_tokens": int}
+#                                              Phase-3.0 detection gate: verifies the inferlet hashed an inbound
+#                                              role:"tool" body and matched a registered context_section handle.
+#                                              The telemetry field reports "tokens a future mid-stream splice would
+#                                              reuse" — Phase 3.0 does not actually skip prefill; see VENDOR_SOURCE #8.
 PROBE_EXPECTATIONS: dict[str, dict[str, Any]] = {
     "probe-ephemeral-handle-recall": {
         "must_contain_all": ["@alice_demo", "1.42"],
@@ -233,6 +240,13 @@ PROBE_EXPECTATIONS: dict[str, dict[str, Any]] = {
         "must_call_tool_with_args": {
             "read_context": {"section_id": "agents.md#coding-style"},
         },
+        # Phase 3.0 (VENDOR_SOURCE #8): after the model calls read_context,
+        # the tool-result envelope carries the registered section body. The
+        # inferlet SHA-256s inbound role:"tool" bodies and reports matched
+        # body-token counts in pie_cache.tool_result_tokens_imported. The
+        # probe passes when at least one chat-completion's telemetry shows
+        # a non-zero match for this section (detection gate).
+        "must_import_kv": {"min_tokens": 1},
     },
 }
 

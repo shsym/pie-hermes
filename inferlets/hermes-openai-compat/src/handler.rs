@@ -332,6 +332,22 @@ pub async fn handle_chat_completions(
         }
     }
 
+    // Phase-3.0: scan inbound role:"tool" messages for bodies matching a
+    // context-section handle registered at boot via Phase 2.1 (see
+    // VENDOR_SOURCE.md #8). Detection-only today — KV path is unchanged.
+    //
+    // `detect_tool_result_matches` returns `None` when there are no tool
+    // messages (field stays absent — avoids conflating "no tools present"
+    // with "tools present but no match"), `Some(0)` when tool messages
+    // exist but none match a registered handle, and `Some(n)` with the
+    // sum of body-token counts on match. The field's presence/value is
+    // what the `must_import_kv` probe gate discriminates on.
+    let tool_match_tokens =
+        crate::context_section::detect_tool_result_matches(&request.messages, &prepared.model);
+    if let Some(cache) = prepared.pie_cache.as_mut() {
+        cache.tool_result_tokens_imported = tool_match_tokens;
+    }
+
     if request.stream {
         return handle_streaming(responder, prepared, &request, max_tokens, temperature, top_p, t_entry, t_json, t_prepare, body_len, adaptive_stop).await;
     }
@@ -341,7 +357,7 @@ pub async fn handle_chat_completions(
         model,
         mut ctx,
         prompt_tokens,
-        pie_cache,
+        mut pie_cache,
         profile: _,
         session_incoming_tokens,
     } = prepared;
@@ -358,7 +374,7 @@ pub async fn handle_chat_completions(
         (result.text, meta)
     } else {
         // Single-candidate path (original behavior).
-        let sampler = build_sampler(&model, &request, temperature, top_p).await;
+        let sampler = build_sampler(&model, &request).await;
         let base_cond = max_len(max_tokens).or(ends_with_any(model.eos_tokens()));
         let stop_cond = build_stop_condition(base_cond, adaptive_stop, &model);
         let generated = ctx.generate(sampler, stop_cond).await;
@@ -378,7 +394,12 @@ pub async fn handle_chat_completions(
         // produced ExportSync FAILED / PointerNotAllocated errors that hung
         // connections in our c=4/8/16 sweep.  Task #27 Non-goals rule out
         // redesigning the chain-hash scheme, so we validate lookup-only here.
-        save_session_kv_state(&ctx, &request, session_incoming_tokens.as_deref());
+        save_session_kv_state_and_annotate(
+            &ctx,
+            &request,
+            session_incoming_tokens.as_deref(),
+            &mut pie_cache,
+        );
     }
 
     // Parse tool calls from model output
@@ -469,14 +490,10 @@ fn build_stop_condition<S: StopCondition + 'static>(
 ///
 /// Non-grammar path delegates to `Model::build_sampler`, which merges
 /// client-supplied `SamplingOverrides` with the model's
-/// `generation_config.json` defaults (F2 unified sampling). The
-/// `_temperature`/`_top_p` params are unused after A7 — retained for caller
-/// signature stability; will be removed in a follow-up.
+/// `generation_config.json` defaults (F2 unified sampling).
 async fn build_sampler(
     model: &inferlet::Model,
     request: &ChatCompletionRequest,
-    _temperature: f32,
-    _top_p: f32,
 ) -> Sampler {
     let overrides = request_to_sampling_overrides(request);
 
@@ -487,10 +504,12 @@ async fn build_sampler(
 
     if let Some(tools) = &request.tools {
         if !tools.is_empty() {
-            // Grammar-constrained path. Effective rep_penalty/top_p/top_k come
-            // from the same overrides.or(defaults) merge the SDK uses on the
-            // non-grammar path — so swapping to a non-Qwen model automatically
-            // picks up the new model's generation_config.json values (F2).
+            // Grammar-constrained path. Effective rep_penalty/top_p/top_k/min_p
+            // come from the same overrides.or(defaults) merge the SDK uses on
+            // the non-grammar path — so swapping to a non-Qwen model
+            // automatically picks up the new model's generation_config.json
+            // values (F2). frequency_penalty and presence_penalty are
+            // client-only (no defaults source) per the SDK contract.
             let defaults = model.generation_defaults();
             let rep_penalty = overrides
                 .repetition_penalty
@@ -506,18 +525,32 @@ async fn build_sampler(
                 .or(defaults.top_k)
                 .filter(|k| *k > 0)
                 .unwrap_or(0);
+            let min_p_val = overrides
+                .min_p
+                .or(defaults.min_p)
+                .filter(|m| m.is_finite() && *m > 0.0 && *m < 1.0);
+            let frequency_penalty_val = overrides.frequency_penalty.unwrap_or(0.0);
+            let presence_penalty_val = overrides.presence_penalty.unwrap_or(0.0);
             let temperature_val = overrides
                 .temperature
                 .or(defaults.temperature)
                 .unwrap_or(1.0);
+            // NB: the Phase-D1 "both filters disabled" warning lives inside
+            // `build_tool_call_sampler`, emitted after its first `.await` —
+            // the `no_sync_eprintln_in_async_handlers` guard (VENDOR_SOURCE.md
+            // #5) forbids stderr writes before the first await on any async
+            // path, because wstd hangs requests when it sees them.
             match build_tool_call_sampler(
                 model,
                 tools,
                 &request.tool_choice,
                 temperature_val,
                 rep_penalty,
+                frequency_penalty_val,
+                presence_penalty_val,
                 top_p_val,
                 top_k_val,
+                min_p_val,
             )
             .await
             {
@@ -560,8 +593,11 @@ async fn build_tool_call_sampler(
     tool_choice: &crate::types::ToolChoice,
     temperature: f32,
     rep_penalty: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
     top_p: f32,
     top_k: u32,
+    min_p: Option<f32>,
 ) -> Result<Sampler, String> {
     let tokenizer = model.get_tokenizer();
 
@@ -569,6 +605,26 @@ async fn build_tool_call_sampler(
     let format = crate::tool_format::ToolCallFormat::detect(model)
         .await
         .ok_or("Could not detect tool call format for this model")?;
+
+    // Loudly flag the Phase-D1 risk surface: grammar-constrained sampling
+    // with NO long-tail truncation (top_p disabled, top_k disabled) lets the
+    // stochastic draw reach rare tokens inside the grammar's admissible set
+    // and hallucinate (evidence: bogus "1234567890" integration IDs,
+    // task #23). This warning fires when neither the client nor the model's
+    // generation_config.json supplied a cap — typical for non-Qwen models
+    // that ship empty gen_configs. It is a warning, not a hard-coded safety
+    // floor, so operators can see *why* output drifts rather than have a
+    // hidden default quietly change behavior. Placed after `.await` because
+    // the VENDOR_SOURCE.md #5 guard forbids sync stderr writes before the
+    // first await on async paths.
+    if top_p >= 1.0 && top_k == 0 {
+        eprintln!(
+            "[WARN] grammar-constrained sampling on model {:?} with top_p and top_k both disabled; \
+             long-tail hallucinations likely. Supply top_p/top_k on the request or publish \
+             generation_config.json defaults.",
+            model.get_name(),
+        );
+    }
 
     let grammar = crate::tools_grammar::tools_to_lark_grammar(tools, &format, tool_choice);
 
@@ -594,8 +650,11 @@ async fn build_tool_call_sampler(
         escape_non_printable,
         crate::constrained_sampler::SamplerOptions {
             rep_penalty,
+            frequency_penalty,
+            presence_penalty,
             top_p: Some(top_p),
             top_k: Some(top_k),
+            min_p,
             seed: None,
         },
     );
@@ -603,10 +662,12 @@ async fn build_tool_call_sampler(
     Ok(Sampler::Custom {
         temperature,
         sampler: Box::new(sampler),
-        // Penalties are applied upstream by the constrained sampler itself
-        // (see constrained_sampler.rs); pass Default here so the SDK layer
-        // doesn't re-apply them. This field became mandatory in the pie SDK
-        // at 83d1a6ac (unified sampling: gen_config + Penalties — task23).
+        // Penalties are applied inside `ConstrainedSampler::sample` (see
+        // apply_prob_penalties in constrained_sampler.rs). The SDK runtime
+        // discards `Sampler::Custom.penalties` — `decode_step` destructures
+        // with `..` and never forwards them to a Custom sampler — so this
+        // field would be ignored whatever we passed. `Penalties::default()`
+        // documents that the WASM side has already accounted for them.
         penalties: inferlet::sampler::Penalties::default(),
     })
 }
@@ -734,14 +795,14 @@ async fn handle_streaming(
         model,
         mut ctx,
         prompt_tokens: _,
-        pie_cache,
+        mut pie_cache,
         profile: prepare_profile,
         session_incoming_tokens,
     } = prepared;
     let model_name = model.get_name();
     let tokenizer = model.get_tokenizer();
 
-    let sampler = build_sampler(&model, request, temperature, top_p).await;
+    let sampler = build_sampler(&model, request).await;
     // Custom (constrained) samplers are incompatible with multi-step decode_n
     // (engine-side sampling). Fall back to single-step decode when constrained.
     let is_constrained = matches!(sampler, Sampler::Custom { .. });
@@ -1029,6 +1090,19 @@ async fn handle_streaming(
         let _ = body.flush().await;
     }
 
+    // Chat-path save_ctx_blocks intentionally omitted on this experimental
+    // branch (matches the non-streaming path).  Warmup handler populates
+    // block_cache; chat-path re-saves floods the runtime's export registry.
+    //
+    // Run BEFORE the PIE-CACHE comment + final chunk so any
+    // session_kv_save_error tag is visible to both emission paths.
+    save_session_kv_state_and_annotate(
+        &ctx,
+        request,
+        session_incoming_tokens.as_deref(),
+        &mut pie_cache,
+    );
+
     if let Some(pie_cache) = &pie_cache {
         let cache_comment = format!(
             ": [PIE-CACHE] {}\n\n",
@@ -1037,11 +1111,6 @@ async fn handle_streaming(
         let _ = body.write_all(cache_comment.as_bytes()).await;
         let _ = body.flush().await;
     }
-
-    // Chat-path save_ctx_blocks intentionally omitted on this experimental
-    // branch (matches the non-streaming path).  Warmup handler populates
-    // block_cache; chat-path re-saves floods the runtime's export registry.
-    save_session_kv_state(&ctx, request, session_incoming_tokens.as_deref());
 
     // [Phase-B instrumentation] Emit the raw generated text as an SSE
     // comment so the observer can diff pie's model output against vLLM's on
@@ -1255,6 +1324,8 @@ async fn prepare_execution(
             tail_tokens_filled: None,
             fallback_reason: None,
             ephemeral_tokens_appended: None,
+            tool_result_tokens_imported: None,
+            session_kv_save_error: None,
         }),
         profile: PrepareProfile {
             format_chat_ms,
@@ -1348,6 +1419,8 @@ async fn prepare_variant_execution(
             tail_tokens_filled: None,
             fallback_reason: None,
             ephemeral_tokens_appended: None,
+            tool_result_tokens_imported: None,
+            session_kv_save_error: None,
         }),
         profile: PrepareProfile {
             format_chat_ms,
@@ -1368,12 +1441,13 @@ async fn prepare_session_execution(
     let t_start = std::time::Instant::now();
     let session_id = &request.pie_session.as_ref().unwrap().session_id;
 
-    // Reorder dynamic system sections (## Messaging/## Reactions/## Runtime) to
-    // the end before tokenization. This is required for the prefix checkpoint
-    // path to work across channels: the checkpoint stores tokens of the
-    // reordered stable prefix, and incoming tokens must use the same ordering
-    // so `find_prefix_match_len` sees an aligned prefix.  Session KV (Level 1)
-    // also uses the reordered form for consistency.
+    // Reorder dynamic system sections (## Current Session Context) to the
+    // end before tokenization. Required for the prefix checkpoint path to
+    // work across users on the same bearer: the checkpoint stores tokens
+    // of the reordered stable prefix, and incoming tokens must use the
+    // same ordering so `find_prefix_match_len` sees an aligned prefix.
+    // Session KV (Level 1) also uses the reordered form for consistency.
+    // See `prompt_render::DYNAMIC_SECTIONS` for the marker list.
     let reordered_messages = crate::prompt_render::reorder_system_sections(&request.messages);
 
     // Tokenize WITHOUT generation prompt (one call instead of two).
@@ -1466,6 +1540,8 @@ async fn prepare_session_execution(
                         tail_tokens_filled: Some(tail_len),
                         fallback_reason: None,
                         ephemeral_tokens_appended: None,
+                        tool_result_tokens_imported: None,
+                        session_kv_save_error: None,
                     }),
                     profile: PrepareProfile {
                         format_chat_ms,
@@ -1524,6 +1600,8 @@ async fn prepare_session_execution(
                         tail_tokens_filled: Some(tail_len),
                         fallback_reason: None,
                         ephemeral_tokens_appended: None,
+                        tool_result_tokens_imported: None,
+                        session_kv_save_error: None,
                     }),
                     profile: PrepareProfile {
                         format_chat_ms,
@@ -1592,6 +1670,8 @@ async fn prepare_session_execution(
                         tail_tokens_filled: Some(tail_len),
                         fallback_reason: Some("block_cache_hit".to_string()),
                         ephemeral_tokens_appended: None,
+                        tool_result_tokens_imported: None,
+                        session_kv_save_error: None,
                     }),
                     profile: PrepareProfile {
                         format_chat_ms,
@@ -1640,6 +1720,8 @@ async fn prepare_session_execution(
             tail_tokens_filled: Some(total_incoming),
             fallback_reason: Some("full_prefill".to_string()),
             ephemeral_tokens_appended: None,
+            tool_result_tokens_imported: None,
+            session_kv_save_error: None,
         }),
         profile: PrepareProfile {
             format_chat_ms,
@@ -1695,6 +1777,8 @@ async fn prepare_structured_execution(
                     tail_tokens_filled: None,
                     fallback_reason: None,
                     ephemeral_tokens_appended: None,
+                    tool_result_tokens_imported: None,
+                    session_kv_save_error: None,
                 }),
             )
             .await;
@@ -1727,6 +1811,8 @@ async fn prepare_structured_execution(
                         tail_tokens_filled: None,
                         fallback_reason: None,
                         ephemeral_tokens_appended: None,
+                        tool_result_tokens_imported: None,
+                        session_kv_save_error: None,
                     }),
                 )
                 .await;
@@ -1761,6 +1847,8 @@ async fn prepare_structured_execution(
                         tail_tokens_filled: None,
                         fallback_reason: None,
                         ephemeral_tokens_appended: None,
+                        tool_result_tokens_imported: None,
+                        session_kv_save_error: None,
                     }),
                 )
                 .await;
@@ -1822,6 +1910,8 @@ async fn prepare_structured_execution(
                     tail_tokens_filled: None,
                     fallback_reason: None,
                     ephemeral_tokens_appended: None,
+                    tool_result_tokens_imported: None,
+                    session_kv_save_error: None,
                 }),
             )
             .await;
@@ -1854,6 +1944,8 @@ async fn prepare_structured_execution(
                             tail_tokens_filled: None,
                             fallback_reason: None,
                             ephemeral_tokens_appended: None,
+                            tool_result_tokens_imported: None,
+                            session_kv_save_error: None,
                         }),
                     )
                     .await;
@@ -1930,6 +2022,8 @@ async fn prepare_structured_execution(
             tail_tokens_filled: None,
             fallback_reason: None,
             ephemeral_tokens_appended: None,
+            tool_result_tokens_imported: None,
+            session_kv_save_error: None,
         }),
         profile: PrepareProfile {
             format_chat_ms: validate_prefix_ms + format_chat_tail_ms,
@@ -2061,35 +2155,67 @@ fn first_token_mismatch(left: &[u32], right: &[u32]) -> Option<u32> {
 /// `incoming_tokens` is the format_chat output for THIS turn's input messages —
 /// it's what the next turn will compare against (not ctx.get_token_ids() which
 /// includes generated tokens that don't round-trip through format_chat).
+/// Return value:
+/// * `Ok(true)`  — attempted and succeeded.
+/// * `Ok(false)` — no attempt (no `pie_session`, no incoming tokens, or
+///                 empty ctx). Not an error condition.
+/// * `Err(tag)`  — attempted and the engine rejected the export. The tag
+///                 is a short stable string suitable for surfacing in
+///                 `PieCacheTelemetry::session_kv_save_error` so a rising
+///                 failure rate is observable without an eprintln (which
+///                 wedges the response under wstd — see task #47).
 fn save_session_kv_state(
     ctx: &inferlet::Context,
     request: &ChatCompletionRequest,
     incoming_tokens: Option<&[u32]>,
-) {
+) -> Result<bool, &'static str> {
     let pie_session = match &request.pie_session {
         Some(s) => s,
-        None => return,
+        None => return Ok(false),
     };
     let incoming = match incoming_tokens {
         Some(t) => t,
-        None => return,
+        None => return Ok(false),
     };
 
     let session_id = &pie_session.session_id;
     let kv_page_last_len = ctx.get_kv_page_last_len();
 
     if ctx.kv_pages.is_empty() {
-        return;
+        return Ok(false);
     }
 
     // Versioned export names: the runtime keeps exports as shared read-only
     // resources (import doesn't consume), so each turn must use a unique name.
-    // Old exports accumulate but are harmless — they reference the same
-    // physical pages (a subset of the current turn's pages).  They are
-    // cleaned up when the session is evicted (evict_session releases all).
-    let turn_count = crate::session_cache::load_session_state(session_id)
+    //
+    // Corrigendum — prior comment claimed "old exports accumulate but are
+    // harmless … cleaned up when the session is evicted (evict_session
+    // releases all)." That was wrong: `evict_session` only releases the
+    // CURRENT `state.export_name`, not prior turns'. The prior version of
+    // this code therefore leaked one export name per turn in the engine's
+    // resource registry. Observable symptom: after enough turns, a
+    // re-registration of the same (session_id, turn_count) pair hit
+    // ExportNameExists and the inferlet returned a truncated hyper response
+    // (see 2026-04-24 Phase-3.0 replay sweep FINDINGS).
+    //
+    // Fix: release the prior turn's export BEFORE we create the new one.
+    // This maintains exactly one live export per session at any time. The
+    // ordering (release-then-export, not export-then-release) is chosen for
+    // crash resilience: if we crash between release and export, the stored
+    // SessionKvState still points to the just-released name. The next
+    // load_session_state returns it, `import_kv_pages` finds no pages,
+    // `import_session_kv` returns None, and the request falls through to
+    // `prefix_checkpoint` or `full_prefill` — self-healing. The reverse
+    // order would leave a new export orphaned in the registry on the same
+    // crash window, with no state pointer to find it later.
+    let prior_state = crate::session_cache::load_session_state(session_id);
+    let turn_count = prior_state
+        .as_ref()
         .map(|s| s.turn_count + 1)
         .unwrap_or(1);
+    if let Some(prior) = &prior_state {
+        ctx.queue.release_exported_kv_pages(&prior.export_name);
+    }
 
     let export_name = format!("session-kv:{}:t{}", session_id, turn_count);
 
@@ -2097,22 +2223,28 @@ fn save_session_kv_state(
     // count accounting edge case removed a ptr from the instance's allocated
     // set between import and export, or an ExportNameExists collision with a
     // concurrent request sharing the same session_id), skip save_session_state
-    // silently. NO eprintln! here — we are executing inside a sync helper
-    // called from an async-executed handler, and on wasm32-wasip2/wstd a
-    // sync stderr write from this context wedges the request's HTTP response
-    // (see test_no_sync_eprintln.rs; task #47 N≥8 IncompleteMessage repro
-    // pinned the wedge here).
+    // but surface the failure on TWO axes so an operator can see it both
+    // per-request and pod-aggregate. NO eprintln! here — we are executing
+    // inside a sync helper called from an async-executed handler, and on
+    // wasm32-wasip2/wstd a sync stderr write from this context wedges the
+    // request's HTTP response (see test_no_sync_eprintln.rs; task #47 N≥8
+    // IncompleteMessage repro pinned the wedge here).
     //
-    // Observability: record the failure in kvs so `/v1/pie/block-cache/status`
-    // surfaces a counter + the most recent message.  `inferlet::store_set`
-    // is not stderr and does not wedge (kvs rides the normal command
-    // dispatcher, not a synchronous i/o handle).
+    // Observability layers, both wedge-safe (kvs and the Result return
+    // both ride the normal command dispatcher, not a synchronous i/o handle):
+    //   1. Per-request: return `Err(tag)` so `save_session_kv_state_and_annotate`
+    //      writes the tag into `pie_cache.session_kv_save_error` (visible to
+    //      the failing request's caller).
+    //   2. Pod-aggregate: bump `bc:stats:export_errors_total` and record the
+    //      most recent message in `bc:stats:last_export_error`, exposed via
+    //      `GET /v1/pie/block-cache/status` (visible to operators monitoring
+    //      across requests).
     if let Err(e) = ctx.queue.export_kv_pages_sync(&ctx.kv_pages, &export_name) {
         crate::block_cache::record_export_error(&format!(
             "export_kv_pages_sync({}): {}",
             export_name, e
         ));
-        return;
+        return Err("export_kv_pages_sync_err");
     }
 
     let reordered = crate::prompt_render::reorder_system_sections(&request.messages);
@@ -2127,6 +2259,26 @@ fn save_session_kv_state(
         prefix_checkpoint_hash: system_hash,
     };
     crate::session_cache::save_session_state(&state);
+    Ok(true)
+}
+
+/// Run `save_session_kv_state` and annotate the request's `pie_cache`
+/// telemetry with any error tag. Keeps the call sites terse: the two
+/// handler paths (non-streaming, streaming) each call this once.
+fn save_session_kv_state_and_annotate(
+    ctx: &inferlet::Context,
+    request: &ChatCompletionRequest,
+    incoming_tokens: Option<&[u32]>,
+    pie_cache: &mut Option<PieCacheTelemetry>,
+) {
+    match save_session_kv_state(ctx, request, incoming_tokens) {
+        Ok(_) => {}
+        Err(tag) => {
+            if let Some(cache) = pie_cache.as_mut() {
+                cache.session_kv_save_error = Some(tag.to_string());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
