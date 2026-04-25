@@ -15,6 +15,11 @@
 # Usage:
 #   scripts/deploy-hermes-inferlet.sh HOST:PORT
 #   scripts/deploy-hermes-inferlet.sh HOST:PORT --model MODEL --max-tokens N
+#   scripts/deploy-hermes-inferlet.sh HOST:PORT -- --block-cache-budget-pages=128
+#
+# Anything after the `--` sentinel is forwarded as launch arguments to the
+# inferlet (after pie http's own arg parser).  Use this for inferlet-side
+# flags such as block-cache budget, debug toggles, etc.
 #
 # Env:
 #   PIECLAW_DIR        — path to pieclaw checkout (for setup-engine.sh). Default: ../pieclaw
@@ -43,11 +48,13 @@ PIE_TOML="$REPO_ROOT/inferlets/hermes-openai-compat/Pie.toml"
 SETUP_ENGINE="$PIECLAW_DIR/scripts/setup-engine.sh"
 
 HOST_PORT=""
+INFERLET_ARGS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --model) MODEL="$2"; shift 2 ;;
         --max-tokens) MAX_TOKENS="$2"; shift 2 ;;
         --local-port) TUNNEL_LOCAL_PORT="$2"; shift 2 ;;
+        --) shift; INFERLET_ARGS=("$@"); break ;;
         *)
             if [ -z "$HOST_PORT" ]; then HOST_PORT="$1"; shift
             else echo "unknown arg: $1" >&2; exit 2; fi
@@ -56,7 +63,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$HOST_PORT" ]; then
-    echo "usage: $0 HOST:PORT [--model MODEL] [--max-tokens N] [--local-port N]" >&2
+    echo "usage: $0 HOST:PORT [--model MODEL] [--max-tokens N] [--local-port N] [-- INFERLET_ARGS...]" >&2
     exit 2
 fi
 
@@ -67,7 +74,11 @@ for f in "$WASM_FILE" "$PIE_TOML" "$SETUP_ENGINE"; do
     [ -f "$f" ] || { echo "missing: $f" >&2; exit 2; }
 done
 
-SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
+# ServerAliveInterval/CountMax tolerates ~60s of intermittent unresponsiveness
+# from the pod side (observed during high-CPU windows like model load and
+# process teardown) before the SSH session is declared dead.  Without these
+# the script would exit non-zero (set -e) on a single transient reset.
+SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 SSH="ssh $SSH_OPTS -p $PORT root@$HOST"
 SCP="scp $SSH_OPTS -P $PORT"
 
@@ -90,30 +101,53 @@ echo ""
 echo "=== Step 4: Kill standalone engine, wait for GPU idle ==="
 # Kill the standalone pie serve (setup-engine.sh left it running); pie http
 # starts its own engine from config.toml.
-$SSH "pkill -f 'pie serve' || true; pkill -f 'pie http' || true; sleep 5"
-# Poll GPU memory — tolerate non-numeric readings during driver startup.
-for i in 1 2 3 4 5 6; do
-    MEM=$($SSH "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1" 2>/dev/null | tr -d '[:space:]' || echo "")
-    MEM="${MEM:-unknown}"
-    echo "  GPU mem: ${MEM} MiB"
-    case "$MEM" in
-        ''|*[!0-9]*) sleep 5; continue ;;
-    esac
-    if [ "$MEM" -lt 500 ]; then
-        echo "  GPU idle."
-        break
-    fi
-    sleep 5
-done
+#
+# The kill + GPU-memory-poll loop runs in a SINGLE pod-side ssh session.
+# Earlier this script ran one ssh per polling iteration; intermittent
+# `Connection reset by peer` from the pod's sshd during process teardown
+# would propagate through `set -e` and abort the script before the GPU
+# returned to idle (observed 2026-04-25 on RunPod A100-SXM4-80GB).
+$SSH 'set -u
+    pkill -f "pie serve" 2>/dev/null || true
+    pkill -f "pie http"  2>/dev/null || true
+    for i in $(seq 1 12); do
+        sleep 5
+        MEM=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d "[:space:]")
+        case "$MEM" in
+            ""|*[!0-9]*) echo "  iter=$i: GPU mem=unknown (driver busy)"; continue ;;
+        esac
+        echo "  iter=$i: GPU mem=${MEM} MiB"
+        if [ "$MEM" -lt 500 ]; then
+            echo "  GPU idle."
+            exit 0
+        fi
+    done
+    # Soft fail — Step 6 will catch a stuck pie http via the health-check
+    # timeout. Better to proceed and report the real symptom there than
+    # abort with a generic "GPU not idle" message.
+    echo "  WARN: GPU did not return to idle within 60s; continuing anyway." >&2
+'
 
 echo ""
 echo "=== Step 5: Start pie http with hermes_openai_compat.wasm ==="
 # pie http takes --path/--port/--config; no --manifest.  It bundles the engine,
 # so a standalone `pie serve` must not be running simultaneously.
+#
+# Anything passed after `--` on this script's command line is appended after
+# pie http's own argv, which makes it visible to the inferlet via
+# `inferlet::get_arguments()`.  Each forwarded arg is shell-escaped via
+# `printf %q` so values with whitespace or shell metacharacters survive the
+# nested local→ssh→remote-shell parsing.
+INFERLET_ARGS_CMD=""
+if [ ${#INFERLET_ARGS[@]} -gt 0 ]; then
+    INFERLET_ARGS_CMD="-- $(printf '%q ' "${INFERLET_ARGS[@]}")"
+    echo "  Forwarding to inferlet: ${INFERLET_ARGS[*]}"
+fi
 $SSH ": > /tmp/pie-http.log; nohup /opt/pie/pie-vllm-src/pie/pie/.venv/bin/pie http \
         --path /tmp/hermes_openai_compat.wasm \
         --port $INFERLET_PORT \
         --config /root/.pie/engines/eng_benchmark/config.toml \
+        $INFERLET_ARGS_CMD \
         >/tmp/pie-http.log 2>&1 &"
 echo "  Started pie http in background (log: /tmp/pie-http.log on pod)."
 
